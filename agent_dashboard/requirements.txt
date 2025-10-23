@@ -1,0 +1,9 @@
+streamlit 
+streamlit-authenticator 
+google-cloud-firestore
+pandas
+openai
+dotenv
+firebase-admin
+google-cloud-firestore
+requests

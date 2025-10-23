@@ -1,0 +1,10 @@
+credentials:
+  usernames:
+    aryan527:
+      email: aryan.applications@gmail.com
+      name: Aryan Agrawal
+      password: Aryan@1234
+cookie:
+  expiry_days: 0
+  key: 2783675f66db30457394a074c63e09ea
+  name: inzone_auth
