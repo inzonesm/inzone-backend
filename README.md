@@ -2,6 +2,28 @@
 
 A multi-component social media platform with AI-powered features, agent management, and content generation capabilities.
 
+## Quick Start for InZone API
+
+**Want to run, test, or deploy the InZone API?** Use the interactive deployment script:
+
+```bash
+cd inzoneapi
+python deploy.py
+```
+
+This single command handles:
+- 🚀 Running locally
+- 🧪 Deploying to test environment
+- 📦 Deploying to production
+- 🔍 Viewing environment configuration
+- ✅ Validating before deployment
+
+**Always use `deploy.py` for InZone API** - it prevents configuration errors and shows you exactly what's being deployed!
+
+See full setup instructions below ↓
+
+---
+
 ## Project Structure
 
 ```
@@ -21,19 +43,13 @@ inzonesm/
 - **Git** - For version control
 
 ### Required API Keys & Credentials
-1. **Google Cloud / Firebase**
-   - Firebase Admin SDK credentials (`key.json`)
-   - Enable Firestore Database
-   - Enable Cloud Run (for deployment)
 
-2. **OpenAI API**
-   - API key from [platform.openai.com](https://platform.openai.com)
+All API keys and credentials should be configured in your local environment files. See the [Environment Files Guide](inzoneapi/ENV_FILES_EXPLAINED.md) for detailed setup instructions.
 
-3. **ElevenLabs API** (optional)
-   - API key from [elevenlabs.io](https://elevenlabs.io)
-
-4. **Meshy API** (optional)
-   - API key from Meshy platform
+**Quick Setup:**
+- Copy `.env.example` to `.env.local` for local development
+- Create `envs.local.yaml` for local cloud testing
+- Follow the environment files guide for proper configuration
 
 ## Installation
 
@@ -47,8 +63,6 @@ cd inzonesm
 ### 2. Set Up InZone API (Main Backend)
 
 ```bash
-cd inzoneapi
-
 # Create virtual environment
 python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
@@ -56,37 +70,19 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Create .env file
-cp .env.example .env  # If example exists, otherwise create manually
+cd inzoneapi
+
+# Set up environment files - env and key.json (see ENV_FILES_EXPLAINED.md for details)
+cp .env.example .env.local
+# Edit .env.local with API keys and credentials (from Jayme)
 ```
 
-Edit `.env` file with credentials from Jayme:
-```env
-OPENAI_API_KEY=your_openai_api_key_here
-ELEVENLABS_API_KEY=your_elevenlabs_api_key_here
-MESH_API_KEY=your_meshy_api_key_here
-GOOGLE_APPLICATION_CREDENTIALS=./key.json
-OPENAI_MODEL=gpt-4
-PACKAGE_NAME=inzone
-```
-
-Add Firebase credentials (ask Jayme):
-```bash
-# Place your Firebase Admin SDK key.json file in the inzoneapi directory
-# Download from: Firebase Console > Project Settings > Service Accounts
-```
+Configure your local environment by editing `.env.local` with your credentials. See [inzoneapi/ENV_FILES_EXPLAINED.md](inzoneapi/ENV_FILES_EXPLAINED.md) for detailed instructions on setting up all required API keys and Firebase credentials.
 
 ### 3. Set Up Agent Dashboard
 
 ```bash
 cd ../agent_dashboard
-
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
 
 # Add Firebase credentials
 # Copy key.json to this directory
@@ -100,7 +96,6 @@ cp ../inzoneapi/key.json .
 ```bash
 cd ../agents_backend
 
-# Install dependencies (if requirements.txt exists)
 # Add API keys
 # Copy key.json and openai_key.txt to this directory
 ```
@@ -109,9 +104,27 @@ cd ../agents_backend
 
 ### Run InZone API (Main Backend)
 
+#### ⭐ Preferred Method: Interactive Script
+
 ```bash
 cd inzoneapi
-source venv/bin/activate
+
+# Use the interactive deployment manager
+python deploy.py
+
+# Then choose option 1: "Run locally"
+```
+
+This will:
+- Show all environment variables from `.env`
+- Validate your configuration
+- Let you choose the port
+- Run the Flask app
+
+#### Alternative: Direct Command
+
+```bash
+cd inzoneapi
 
 # Development mode
 python app.py
@@ -120,13 +133,12 @@ python app.py
 gunicorn --bind 0.0.0.0:8080 --workers 1 --threads 8 --timeout 0 app:app
 ```
 
-The API will be available at `http://localhost:8080`
+The API will be available at `http://localhost:8080` (or your chosen port)
 
 ### Run Agent Dashboard
 
 ```bash
 cd agent_dashboard
-source venv/bin/activate
 
 streamlit run login.py --server.port 8080 --server.address 0.0.0.0
 ```
@@ -168,26 +180,75 @@ docker run -p 8080:8080 \
 
 ## Google Cloud Run Deployment
 
-### Deploy InZone API
+### Deploy InZone API ⭐ PREFERRED METHOD
+
+**Always use the interactive deployment script** - it shows you which environment files are being used and validates configuration before deployment:
 
 ```bash
 cd inzoneapi
 
-# Build and push to Google Container Registry
-gcloud builds submit --tag gcr.io/YOUR-PROJECT-ID/inzoneapi
+# Interactive deployment manager (RECOMMENDED)
+python deploy.py
+```
 
-# Deploy to Cloud Run
-gcloud run deploy inzoneapi \
-  --image gcr.io/YOUR-PROJECT-ID/inzoneapi \
-  --platform managed \
+The script will:
+- ✅ Show you all environment variables before deployment
+- ✅ Let you choose: Local Development, Test Environment, or Production
+- ✅ Display which environment file is active (`.env`, `envs.test.yaml`, `envs.yaml`)
+- ✅ Validate configuration and prevent errors
+- ✅ Mask sensitive API keys for security
+- ✅ Guide you through safe deployments
+
+**Options available in deploy.py:**
+1. **Run Locally** - Uses `.env` file for local development
+2. **Deploy to Test** - Uses `envs.test.yaml` for test environment (`inzoneapi-test` service)
+3. **Deploy to Production** - Uses `envs.yaml` for production (`inzoneapi` service)
+4. **Build Docker Only** - Build without deploying
+5. **View Environment Status** - Check all environment files
+
+See [inzoneapi/DEPLOY_SCRIPT_GUIDE.md](inzoneapi/DEPLOY_SCRIPT_GUIDE.md) for detailed usage examples.
+
+---
+
+#### Manual Deployment (Backup Method)
+
+If you need to deploy manually without the interactive script:
+
+**Test Environment:**
+```bash
+cd inzoneapi
+
+# Using the shell script
+chmod +x deploy_cloud_run_test.sh
+./deploy_cloud_run_test.sh
+
+# Or manually
+gcloud builds submit --tag gcr.io/inzone-f93e4/inzoneapi:test
+gcloud run deploy inzoneapi-test \
+  --image gcr.io/inzone-f93e4/inzoneapi:test \
   --region us-central1 \
-  --allow-unauthenticated \
-  --set-env-vars OPENAI_API_KEY=your_key,ELEVENLABS_API_KEY=your_key,MESH_API_KEY=your_key
+  --env-vars-file envs.test.yaml
+```
 
-# Or use the deploy script
+**Production Environment:**
+```bash
+cd inzoneapi
+
+# Using the shell script
 chmod +x deploy_cloud_run.sh
 ./deploy_cloud_run.sh
+
+# Or manually
+gcloud builds submit --tag gcr.io/inzone-f93e4/inzoneapi
+gcloud run deploy inzoneapi \
+  --image gcr.io/inzone-f93e4/inzoneapi \
+  --region us-central1 \
+  --env-vars-file envs.yaml
 ```
+
+**Note:** Manual deployment requires you to manage environment files yourself and won't show validation warnings.
+
+---
 
 ### Deploy Agent Dashboard
 
@@ -195,11 +256,12 @@ chmod +x deploy_cloud_run.sh
 cd agent_dashboard
 
 # Build and deploy
-gcloud builds submit --tag gcr.io/YOUR-PROJECT-ID/agent-dashboard
+gcloud builds submit --tag gcr.io/inzone-f93e4/agent-dashboard
 gcloud run deploy agent-dashboard \
-  --image gcr.io/YOUR-PROJECT-ID/agent-dashboard \
+  --image gcr.io/inzone-f93e4/agent-dashboard \
   --platform managed \
-  --region us-central1
+  --region us-east1 \
+  --env-vars-file envs.yaml
 
 # Or use the deploy script
 chmod +x deploy.sh
@@ -208,10 +270,39 @@ chmod +x deploy.sh
 
 ## Configuration Files
 
-### Environment Variables (.env)
-Create `.env` files in each component directory:
-- `inzoneapi/.env` - Main API configuration
-- Add all required API keys and credentials
+### Environment Variables
+
+The InZone API uses different environment files for different purposes:
+
+| File | Purpose | Used When |
+|------|---------|-----------|
+| `.env` | Local development | Running `python app.py` locally |
+| `envs.yaml` | Production cloud | Deploying to production Cloud Run |
+| `envs.test.yaml` | Test cloud | Deploying to test Cloud Run |
+| `.env.example` | Template/documentation | Setting up the project |
+
+**See [inzoneapi/ENV_FILES_EXPLAINED.md](inzoneapi/ENV_FILES_EXPLAINED.md) for detailed explanations and examples.**
+
+#### Quick Setup:
+
+1. **Local Development:**
+   ```bash
+   cd inzoneapi
+   cp .env.example .env
+   # Edit .env with your actual API keys
+   ```
+
+2. **Test Deployment:**
+   ```bash
+   # envs.test.yaml already exists
+   # Edit if you need test-specific configuration
+   ```
+
+3. **Production Deployment:**
+   ```bash
+   # envs.yaml already exists
+   # Edit with production API keys (ask Jayme)
+   ```
 
 ### Firebase Credentials (key.json)
 - Download from Firebase Console
@@ -219,28 +310,58 @@ Create `.env` files in each component directory:
 - **NEVER commit to Git** (already in .gitignore)
 
 ### YAML Configuration
-- `config.yaml` - Application configuration
-- `envs.yaml` - Environment-specific settings
+- `config.yaml` - Application configuration (Agent Dashboard)
+- `envs.yaml` - Environment-specific settings for Cloud Run
 
 ## Development Workflow
 
-### 1. Make Changes
+### Recommended Workflow for InZone API
+
+1. **Develop locally** with `deploy.py` (option 1)
+2. **Test in cloud** with `deploy.py` (option 2 - test environment)
+3. **Deploy to production** with `deploy.py` (option 3 - after testing)
+
+### Detailed Steps
+
+#### 1. Make Changes
 ```bash
 # Create feature branch
 git checkout -b feature/your-feature-name
 
-# Make changes to code
-# Test locally
+# Make changes to code in your editor
 ```
 
-### 2. Test Locally
+#### 2. Test Locally
 ```bash
-# Test each component individually
+# Use the interactive script (RECOMMENDED)
+cd inzoneapi
+python deploy.py
+# Choose option 1: Run locally
+
+# Alternative: Direct command
 cd inzoneapi && python app.py
-cd agent_dashboard && streamlit run login.py
 ```
 
-### 3. Commit Changes
+#### 3. Test in Cloud (Before Production)
+```bash
+# Deploy to test environment first
+cd inzoneapi
+python deploy.py
+# Choose option 2: Deploy to TEST environment
+
+# Test your changes at the test URL
+# Verify everything works correctly
+```
+
+#### 4. Deploy to Production
+```bash
+# After testing succeeds, deploy to production
+cd inzoneapi
+python deploy.py
+# Choose option 3: Deploy to PRODUCTION environment
+```
+
+#### 5. Commit Changes
 ```bash
 git add .
 git commit -m "Description of changes"

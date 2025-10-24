@@ -1,0 +1,24 @@
+# Example Environment Variables for Google Cloud Run Deployment
+# Copy this file to envs.local.yaml, envs.test.yaml, or envs.yaml
+# and replace placeholder values with your actual credentials
+
+# OpenAI Configuration
+OPENAI_API_KEY: 'your_openai_api_key_here'
+OPENAI_MODEL: 'your_model_here'
+
+# ElevenLabs Text-to-Speech
+ELEVENLABS_API_KEY: 'your_elevenlabs_api_key_here'
+
+# Meshy API for 3D Generation
+MESH_API_KEY: 'your_meshy_api_key_here'
+
+# Google Cloud / Firebase
+GOOGLE_APPLICATION_CREDENTIALS: 'your_path_here'
+
+# Application Settings
+PACKAGE_NAME: 'your_package_name'
+
+# Optional: Additional cloud-specific settings
+# DEBUG: 'false'
+# LOG_LEVEL: 'info'
+# ENVIRONMENT: 'production'
