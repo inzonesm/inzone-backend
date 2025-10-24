@@ -1,0 +1,12 @@
+# Test Environment Variables for InZone API
+# This file is used when deploying to the TEST container
+# You can use the same credentials as production or separate test credentials
+
+OPENAI_API_KEY: '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'
+GOOGLE_APPLICATION_CREDENTIALS: '/app/key.json'
+
+# Optional: Add test-specific environment variables below
+# For example:
+# DEBUG: 'true'
+# LOG_LEVEL: 'debug'
+# TEST_MODE: 'true'
