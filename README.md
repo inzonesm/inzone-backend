@@ -56,14 +56,11 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Install Node.js dependencies
-npm install
-
 # Create .env file
 cp .env.example .env  # If example exists, otherwise create manually
 ```
 
-Edit `.env` file with your credentials:
+Edit `.env` file with credentials from Jayme:
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
 ELEVENLABS_API_KEY=your_elevenlabs_api_key_here
@@ -73,7 +70,7 @@ OPENAI_MODEL=gpt-4
 PACKAGE_NAME=inzone
 ```
 
-Add Firebase credentials:
+Add Firebase credentials (ask Jayme):
 ```bash
 # Place your Firebase Admin SDK key.json file in the inzoneapi directory
 # Download from: Firebase Console > Project Settings > Service Accounts
