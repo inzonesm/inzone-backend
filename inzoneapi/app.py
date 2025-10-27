@@ -287,7 +287,7 @@ class GorseClient:
         """Delete an item (post) from Gorse"""
         if not self.enabled:
             return False
-        
+
         try:
             response = requests.delete(
                 f'{self.api_url}/api/item/{item_id}',
@@ -299,11 +299,233 @@ class GorseClient:
             print(f"Error deleting item from Gorse: {e}")
             return False
 
+    def get_items_by_label(self, label: str, n: int = 100) -> List[str]:
+        """
+        Get all items with a specific label by paginating through the items API
+
+        Args:
+            label: The category label to filter by
+            n: Maximum number of items to return
+
+        Returns:
+            List of item IDs with the specified label
+        """
+        if not self.enabled:
+            return []
+
+        items = []
+        cursor = ""
+        page_size = 100
+        max_pages = 10  # Prevent infinite loops
+        pages_fetched = 0
+
+        while len(items) < n and pages_fetched < max_pages:
+            url = f'{self.api_url}/api/items?n={page_size}'
+            if cursor:
+                url += f'&cursor={cursor}'
+
+            try:
+                response = requests.get(url, headers=self.headers, timeout=5)
+                if response.status_code != 200:
+                    break
+
+                data = response.json()
+                if not data:
+                    break
+
+                # Handle different response formats
+                items_list = data.get('Items', []) if isinstance(data, dict) else []
+
+                # Filter items by label
+                for item in items_list:
+                    if label in item.get('Labels', []):
+                        items.append(item['ItemId'])
+
+                cursor = data.get('Cursor', '') if isinstance(data, dict) else ''
+                if not cursor:
+                    break
+
+                pages_fetched += 1
+
+            except Exception as e:
+                print(f"Error fetching items by label: {e}")
+                break
+
+        return items[:n]
+
+    def get_smart_recommendations(self,
+                                 user_id: str,
+                                 user_labels: List[str],
+                                 n: int = 10,
+                                 target_match_rate: float = 0.7,
+                                 shuffle: bool = True) -> List[str]:
+        """
+        Get smart category-based recommendations for a user with high category match rate
+
+        This method achieves 70%+ match rate by filtering items by user's category labels,
+        then blending with diverse recommendations from Gorse's general algorithm.
+
+        Args:
+            user_id: User ID to get recommendations for
+            user_labels: List of category labels the user is interested in
+            n: Total number of recommendations to return
+            target_match_rate: Target percentage of recommendations from user's categories (0.0-1.0)
+            shuffle: Whether to shuffle the category-based recommendations
+
+        Returns:
+            List of recommended item IDs
+        """
+        if not self.enabled:
+            return []
+
+        recommendations = []
+        n_category = int(n * target_match_rate)
+
+        # Collect items from user's interest categories
+        category_items = []
+        items_per_category = max(20, n_category * 2)  # Get extra for diversity
+
+        for label in user_labels:
+            items = self.get_items_by_label(label, n=items_per_category)
+            category_items.extend(items)
+
+        # Remove duplicates
+        category_items = list(set(category_items))
+
+        # Shuffle for variety (optional)
+        if shuffle:
+            import random
+            random.shuffle(category_items)
+
+        # Take required number from categories
+        recommendations.extend(category_items[:n_category])
+
+        # Fill remaining slots with general/diverse recommendations
+        if len(recommendations) < n:
+            remaining = n - len(recommendations)
+            try:
+                # Get general recommendations from Gorse
+                url = f'{self.api_url}/api/recommend/{user_id}?n={remaining + 10}'
+                response = requests.get(url, headers=self.headers, timeout=5)
+
+                if response.status_code == 200:
+                    general_recs = response.json()
+                    # Filter out duplicates
+                    for rec in general_recs:
+                        if rec not in recommendations and len(recommendations) < n:
+                            recommendations.append(rec)
+            except Exception as e:
+                print(f"Error getting general recommendations: {e}")
+
+        # If still short, pad with remaining category items
+        if len(recommendations) < n:
+            for item in category_items[n_category:]:
+                if item not in recommendations:
+                    recommendations.append(item)
+                if len(recommendations) >= n:
+                    break
+
+        return recommendations[:n]
+
+    def verify_match_rate(self,
+                         recommendations: List[str],
+                         user_labels: List[str]) -> dict:
+        """
+        Verify the match rate of recommendations
+
+        Args:
+            recommendations: List of recommended item IDs
+            user_labels: User's interest labels
+
+        Returns:
+            Dictionary with match statistics
+        """
+        if not self.enabled:
+            return {
+                'total': 0,
+                'matches': 0,
+                'match_rate': 0,
+                'match_percentage': 0,
+                'matched_items': [],
+                'unmatched_items': []
+            }
+
+        matches = 0
+        total = len(recommendations)
+        matched_items = []
+        unmatched_items = []
+
+        for item_id in recommendations:
+            try:
+                response = requests.get(f'{self.api_url}/api/item/{item_id}',
+                                      headers=self.headers, timeout=5)
+                if response.status_code == 200:
+                    item = response.json()
+                    item_labels = item.get('Labels', [])
+
+                    # Check if any user label matches any item label
+                    matching_labels = set(user_labels) & set(item_labels)
+                    if matching_labels:
+                        matches += 1
+                        matched_items.append({
+                            'item_id': item_id,
+                            'labels': item_labels,
+                            'matching': list(matching_labels)
+                        })
+                    else:
+                        unmatched_items.append({
+                            'item_id': item_id,
+                            'labels': item_labels
+                        })
+            except Exception as e:
+                print(f"Error verifying item {item_id}: {e}")
+
+        match_rate = matches / total if total > 0 else 0
+
+        return {
+            'total': total,
+            'matches': matches,
+            'match_rate': match_rate,
+            'match_percentage': round(match_rate * 100, 1),
+            'matched_items': matched_items,
+            'unmatched_items': unmatched_items
+        }
+
 
 # Initialize Gorse client
 GORSE_API_URL = os.getenv('GORSE_API_URL', 'http://localhost:8087')
 GORSE_API_KEY = os.getenv('GORSE_API_KEY', '')
 gorse_client = GorseClient(GORSE_API_URL, GORSE_API_KEY)
+
+# ---------------------------
+# Category Mapper for Master Categories
+# ---------------------------
+
+print("\n" + "="*70)
+print("Initializing Category Mapper for Master Category Mapping...")
+print("="*70)
+
+from category_mapper import CategoryMapper
+
+# Initialize CategoryMapper once at startup (model loading is expensive)
+# similarity_threshold=0.35: Only assign categories with similarity >= 0.35
+# min_categories=1: At least 1 category per user/post
+# max_categories=5: At most 5 categories per user/post
+try:
+    category_mapper = CategoryMapper(
+        similarity_threshold=0.35,
+        min_categories=1,
+        max_categories=5
+    )
+    print("✓ Category Mapper initialized successfully")
+    CATEGORY_MAPPER_ENABLED = True
+except Exception as e:
+    print(f"⚠ Warning: Failed to initialize Category Mapper: {e}")
+    print("  Raw labels will be used without mapping")
+    category_mapper = None
+    CATEGORY_MAPPER_ENABLED = False
+
+print("="*70 + "\n")
 
 # ---------------------------
 # Helper Functions
@@ -1383,27 +1605,40 @@ def update_interests():
         data = request.get_json()
         user_id = data.get("UID")
         interests = data.get("Interests")
-        
+
         print(f"📝 Update interests request for user: {user_id}")
-        print(f"   New interests: {interests}")
-        
+        print(f"   Raw interests: {interests}")
+
         if not user_id or interests is None:
             return jsonify({"success": False, "error": "User Id and Interests are required"}), 400
 
-        # Update the document in Firestore
-        db.collection('humanUsers').document(user_id).update({"user_interests": interests})
+        # Map raw interests to master categories using CategoryMapper
+        master_categories = interests  # Default: use raw interests
+        if CATEGORY_MAPPER_ENABLED and category_mapper and interests:
+            try:
+                master_categories = category_mapper.map_labels_to_categories(interests)
+                print(f"   Mapped to master categories: {master_categories}")
+            except Exception as e:
+                print(f"⚠ Warning: Failed to map categories, using raw interests: {e}")
+                master_categories = interests
+
+        # Update the document in Firestore with BOTH raw and mapped interests
+        db.collection('humanUsers').document(user_id).update({
+            "user_interests": interests,  # Original interests for display
+            "interests": master_categories  # Mapped master categories for Gorse
+        })
         print(f"✓ Updated interests in Firestore for user {user_id}")
-        
-        # Sync updated user interests to Gorse - THIS IS THE MOST IMPORTANT SYNC!
+
+        # Sync MAPPED interests to Gorse - THIS IS THE MOST IMPORTANT SYNC!
         try:
-            gorse_client.insert_user(user_id, labels=interests)
-            print(f"✓ Synced user {user_id} interests to Gorse with {len(interests)} labels")
-            
+            gorse_client.insert_user(user_id, labels=master_categories)
+            print(f"✓ Synced user {user_id} to Gorse with {len(master_categories)} master category labels")
+
             # Note about cache refresh
             gorse_client.refresh_user_recommendations(user_id)
         except Exception as e:
             print(f"⚠ Failed to sync user interests to Gorse: {e}")
-        
+
         return jsonify({"success": True}), 200
     except Exception as ex:
         logger.error("Error updating interests: %s", ex)
@@ -2961,24 +3196,38 @@ def create_human_post():
             "character_info": data.get("character_info")
         }
 
+        # Map categories to master categories using CategoryMapper
+        master_categories = categories  # Default: use raw categories
+        if CATEGORY_MAPPER_ENABLED and category_mapper and categories:
+            try:
+                master_categories = category_mapper.map_labels_to_categories(categories)
+                print(f"   Post categories: {categories} → master: {master_categories}")
+            except Exception as e:
+                print(f"⚠ Warning: Failed to map categories, using raw: {e}")
+                master_categories = categories
+
+        # Store both raw and mapped categories in post_data
+        post_data["master_categories"] = master_categories
+
         db.collection('humanPosts').document(data.get("Id")).set(post_data)
-        
-        # Update Gorse with new post
+
+        # Update Gorse with new post using MAPPED categories
         try:
-            labels = categories.copy() if categories else []
+            # Use master categories for Gorse labels
+            labels = master_categories.copy() if master_categories else []
             if image_content:
-                labels.append('image')
+                labels.append('has_image')
             if video_content:
-                labels.append('video')
-            labels.append('humanPosts')
-            
+                labels.append('has_video')
+            labels.append('human_post')
+
             gorse_client.insert_item(
                 item_id=data.get("Id"),
                 labels=labels,
                 comment=post_text[:200] if post_text else '',
                 timestamp=datetime.now(timezone.utc).isoformat()
             )
-            print(f"✓ Synced post {data.get('Id')} to Gorse")
+            print(f"✓ Synced post {data.get('Id')} to Gorse with {len(master_categories)} master category labels")
         except Exception as e:
             print(f"⚠ Failed to sync post to Gorse: {e}")
 
@@ -3023,29 +3272,43 @@ def create_ai_post():
             "user_name": username,
         }
 
+        # Map categories to master categories using CategoryMapper
+        master_categories = categories  # Default: use raw categories
+        if CATEGORY_MAPPER_ENABLED and category_mapper and categories:
+            try:
+                master_categories = category_mapper.map_labels_to_categories(categories)
+                print(f"   AI post categories: {categories} → master: {master_categories}")
+            except Exception as e:
+                print(f"⚠ Warning: Failed to map categories, using raw: {e}")
+                master_categories = categories
+
+        # Store both raw and mapped categories in post_data
+        post_data["master_categories"] = master_categories
+
         doc_ref = db.collection('aiPosts').document()
         post_id = doc_ref.id
         post_data["id"] = post_id
         doc_ref.set(post_data)
 
         ai_user_ref.update({"posts": firestore.ArrayUnion([post_id])})
-        
-        # Update Gorse with new AI post
+
+        # Update Gorse with new AI post using MAPPED categories
         try:
-            labels = categories.copy() if categories else []
+            # Use master categories for Gorse labels
+            labels = master_categories.copy() if master_categories else []
             if image_content:
-                labels.append('image')
+                labels.append('has_image')
             if video_content:
-                labels.append('video')
-            labels.append('aiPosts')
-            
+                labels.append('has_video')
+            labels.append('ai_post')
+
             gorse_client.insert_item(
                 item_id=post_id,
                 labels=labels,
                 comment=post_text[:200] if post_text else '',
                 timestamp=datetime.now(timezone.utc).isoformat()
             )
-            print(f"✓ Synced AI post {post_id} to Gorse")
+            print(f"✓ Synced AI post {post_id} to Gorse with {len(master_categories)} master category labels")
         except Exception as e:
             print(f"⚠ Failed to sync AI post to Gorse: {e}")
 
@@ -3184,11 +3447,24 @@ def create_repost():
         post_text = data.get("Post").get("TextContent", "")
         image_content = data.get("Post").get("ImageContent", [])
         video_content = data.get("Post").get("VideoContent", [])
+        categories = data.get("category", []) if data.get("category", []) else generate_categories(post_text)
+
+        # Map categories to master categories using CategoryMapper
+        master_categories = categories  # Default: use raw categories
+        if CATEGORY_MAPPER_ENABLED and category_mapper and categories:
+            try:
+                master_categories = category_mapper.map_labels_to_categories(categories)
+                print(f"   Repost categories: {categories} → master: {master_categories}")
+            except Exception as e:
+                print(f"⚠ Warning: Failed to map categories, using raw: {e}")
+                master_categories = categories
 
         post_data = {
             "ai_chat_content": data.get("AIChatContent"),
             "ai_name": data.get("AIName"),
             "ai_profile_image_url": data.get("AIProfileImageURL"),
+            "category": categories,
+            "master_categories": master_categories,
             "comments": [],
             "date_posted": firestore.SERVER_TIMESTAMP,
             "likes": 0,
@@ -3206,6 +3482,25 @@ def create_repost():
         }
 
         db.collection('reposts').document(data.get("Id")).set(post_data)
+
+        # Sync repost to Gorse with MAPPED categories
+        try:
+            labels = master_categories.copy() if master_categories else []
+            if image_content:
+                labels.append('has_image')
+            if video_content:
+                labels.append('has_video')
+            labels.append('repost')
+
+            gorse_client.insert_item(
+                item_id=data.get("Id"),
+                labels=labels,
+                comment=post_text[:200] if post_text else '',
+                timestamp=datetime.now(timezone.utc).isoformat()
+            )
+            print(f"✓ Synced repost {data.get('Id')} to Gorse with {len(master_categories)} master category labels")
+        except Exception as e:
+            print(f"⚠ Failed to sync repost to Gorse: {e}")
 
         return jsonify({"postId": data.get("Id")}), 200
     except Exception as ex:
@@ -3292,6 +3587,83 @@ def get_feed():
 
     except Exception as ex:
         app.logger.exception("Error getting feed")
+        return jsonify({"success": False, "error": str(ex)}), 500
+
+@app.route('/feed/get-smart-recommendations', methods=['POST'])
+def get_smart_recommendations():
+    """
+    Get smart category-based recommendations for a user
+
+    Request body:
+        {
+            "user_id": "user123",
+            "limit": 20,  # optional, default 20
+            "target_match_rate": 0.7,  # optional, default 0.7 (70%)
+            "include_verification": false  # optional, default false
+        }
+
+    Returns personalized recommendations based on user's interest categories
+    with high match rate (70%+ by default)
+    """
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id')
+        limit = data.get('limit', 20)
+        target_match_rate = data.get('target_match_rate', 0.7)
+        include_verification = data.get('include_verification', False)
+
+        if not user_id:
+            return jsonify({"success": False, "error": "user_id is required"}), 400
+
+        # Get user's interest labels from Firestore
+        user_doc = db.collection('humanUsers').document(user_id).get()
+        if not user_doc.exists:
+            return jsonify({"success": False, "error": "User not found"}), 404
+
+        user_data = user_doc.to_dict()
+        user_labels = user_data.get('interests', []) or user_data.get('labels', []) or []
+
+        if not user_labels:
+            # Fallback to regular recommendations if user has no labels
+            post_ids = gorse_client.get_recommendations(user_id, limit=limit)
+            return jsonify({
+                "success": True,
+                "data": {
+                    "recommendations": post_ids,
+                    "method": "fallback_general",
+                    "message": "User has no interest labels, using general recommendations"
+                }
+            }), 200
+
+        # Get smart category-based recommendations
+        recommendations = gorse_client.get_smart_recommendations(
+            user_id=user_id,
+            user_labels=user_labels,
+            n=limit,
+            target_match_rate=target_match_rate,
+            shuffle=True
+        )
+
+        result = {
+            "success": True,
+            "data": {
+                "recommendations": recommendations,
+                "user_labels": user_labels,
+                "total": len(recommendations),
+                "target_match_rate": target_match_rate,
+                "method": "smart_category_based"
+            }
+        }
+
+        # Optional: Include match rate verification
+        if include_verification and recommendations:
+            verification = gorse_client.verify_match_rate(recommendations, user_labels)
+            result["data"]["verification"] = verification
+
+        return jsonify(result), 200
+
+    except Exception as ex:
+        app.logger.exception("Error getting smart recommendations")
         return jsonify({"success": False, "error": str(ex)}), 500
 
 # @app.route('/feed/posts-flow', methods=['GET'])
