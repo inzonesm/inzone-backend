@@ -150,17 +150,54 @@ class GorseClient:
             return []
     
     def record_interaction(self, user_id: str, post_id: str, feedback_type: str):
-        """Record user interaction (read, like, comment, share)"""
+        """
+        Record user interaction (read, like, comment, share) to both Gorse and Firestore
+
+        DUAL-WRITE STRATEGY:
+        1. Firestore: Permanent backup, queryable, restorable
+        2. Gorse: Real-time recommendations
+        """
+        timestamp = datetime.now(timezone.utc)
+        iso_timestamp = timestamp.isoformat()
+
+        # STEP 1: FIRESTORE BACKUP (Primary data store)
+        try:
+            feedback_doc = {
+                'userId': user_id,
+                'postId': post_id,
+                'feedbackType': feedback_type,  # 'read', 'like', 'comment', 'share'
+                'timestamp': timestamp,
+                'isoTimestamp': iso_timestamp
+            }
+
+            # Store in Firestore: userFeedback/{userId}/interactions/{auto_id}
+            db.collection('userFeedback').document(user_id).collection('interactions').add(feedback_doc)
+
+            # Also update user's interaction summary for quick analytics
+            summary_ref = db.collection('userFeedback').document(user_id)
+            summary_ref.set({
+                'userId': user_id,
+                'lastInteraction': timestamp,
+                f'{feedback_type}Count': firestore.Increment(1)
+            }, merge=True)
+
+            print(f"[Backup] ✅ Saved {feedback_type} to Firestore: user={user_id[:10]}..., post={post_id[:10]}...")
+
+        except Exception as e:
+            print(f"[Backup] ⚠️ Error saving feedback to Firestore: {e}")
+            # Continue anyway - Gorse should still work
+
+        # STEP 2: GORSE (Recommendation engine)
         if not self.enabled:
             return
-        
+
         try:
             # Gorse expects an array of feedback items
             feedback_list = [{
                 'FeedbackType': feedback_type,
                 'UserId': user_id,
                 'ItemId': post_id,
-                'Timestamp': datetime.now(timezone.utc).isoformat()
+                'Timestamp': iso_timestamp
             }]
             requests.put(
                 f'{self.api_url}/api/feedback',
@@ -169,7 +206,7 @@ class GorseClient:
                 timeout=5
             )
         except Exception as e:
-            print(f"Error recording interaction: {e}")
+            print(f"[Gorse] ⚠️ Error recording interaction: {e}")
     
     def get_similar_posts(self, post_id: str, limit: int = 5) -> List[str]:
         """Get similar posts based on a post ID"""
@@ -201,7 +238,7 @@ class GorseClient:
         """Get trending/popular posts"""
         if not self.enabled:
             return []
-        
+
         try:
             response = requests.get(
                 f'{self.api_url}/api/popular',
@@ -222,7 +259,42 @@ class GorseClient:
         except Exception as e:
             print(f"Error getting popular posts: {e}")
             return []
-    
+
+    def get_user_viewed_posts(self, user_id: str, feedback_type: str = 'read') -> List[str]:
+        """
+        Get list of posts that user has already viewed/read from Firestore backup
+
+        Args:
+            user_id: User ID to get feedback for
+            feedback_type: Type of feedback to filter (default: 'read')
+
+        Returns:
+            List of item IDs that the user has viewed
+        """
+        try:
+            # Query Firestore backup instead of Gorse
+            interactions_ref = db.collection('userFeedback').document(user_id).collection('interactions')
+
+            # Filter by feedback type (e.g., 'read' for views)
+            interactions = interactions_ref.where('feedbackType', '==', feedback_type).stream()
+
+            # Extract post IDs
+            viewed_posts = []
+            for interaction in interactions:
+                data = interaction.to_dict()
+                post_id = data.get('postId')
+                if post_id:
+                    viewed_posts.append(post_id)
+
+            # Show sample of viewed posts for debugging
+            sample = viewed_posts[:5] if len(viewed_posts) > 5 else viewed_posts
+            print(f"[SmartRecs] User {user_id[:15]}... has viewed {len(viewed_posts)} posts (sample: {[p[:8]+'...' for p in sample]})")
+            return viewed_posts
+
+        except Exception as e:
+            print(f"[SmartRecs] Error getting viewed posts from Firestore for user {user_id}: {e}")
+            return []
+
     def insert_user(self, user_id: str, labels: List[str] = None):
         """Insert or update a user in Gorse"""
         if not self.enabled:
@@ -298,6 +370,127 @@ class GorseClient:
         except Exception as e:
             print(f"Error deleting item from Gorse: {e}")
             return False
+
+    def get_items_by_label_firestore(self, label: str, n: int = 100, user_id: str = None) -> List[str]:
+        """
+        Get posts with a specific masterCategory directly from Firestore (no Gorse dependency)
+
+        Args:
+            label: The category label to filter by
+            n: Maximum number of items to return
+            user_id: User ID for consistent per-user shuffle (optional)
+
+        Returns:
+            List of post IDs with the specified label (shuffled for variety)
+        """
+        try:
+            import random
+            import hashlib
+            from datetime import date
+            
+            post_ids = []
+
+            # Fetch MUCH MORE than needed for maximum variety after shuffling
+            # For n=150 (from 30 * 5), fetch_limit will be min(750, 1000) = 750 posts
+            fetch_limit = min(n * 5, 1000)  # Fetch 5x what we need, max 1000 (increased from 500)
+
+            # Query humanPosts with this category
+            # NOTE: Can't use order_by('date_posted') without composite index
+            # Instead, we fetch more posts and shuffle them
+            human_posts = db.collection('humanPosts')\
+                .where('masterCategories', 'array_contains', label)\
+                .limit(fetch_limit // 2)\
+                .stream()
+
+            for post in human_posts:
+                post_ids.append(post.id)
+
+            # Query aiPosts with this category
+            ai_posts = db.collection('aiPosts')\
+                .where('masterCategories', 'array_contains', label)\
+                .limit(fetch_limit // 2)\
+                .stream()
+
+            for post in ai_posts:
+                post_ids.append(post.id)
+
+            # Shuffle with deterministic seed based on user_id + current date
+            # Same user gets same shuffle order on the same day (consistency)
+            # But different order each day (freshness)
+            if user_id:
+                today = date.today().isoformat()
+                seed_string = f"{user_id}_{label}_{today}"
+                seed = int(hashlib.md5(seed_string.encode()).hexdigest(), 16) % (2**32)
+                random.seed(seed)
+            
+            random.shuffle(post_ids)
+            random.seed()  # Reset to random seed for other operations
+
+            print(f"[Firestore] Found {len(post_ids)} posts for label '{label}' (shuffled, {fetch_limit} limit)")
+            return post_ids[:n]
+
+        except Exception as e:
+            print(f"[Firestore] Error getting posts by label '{label}': {e}")
+            return []
+
+    def get_diverse_posts_firestore(self, n: int = 100, user_id: str = None) -> List[str]:
+        """
+        Get diverse recent posts from ALL categories for exploration
+
+        This fetches posts without category filtering to provide discovery/exploration.
+        Posts are ordered by recency to ensure fresh content, then shuffled for variety.
+
+        Args:
+            n: Maximum number of items to return
+            user_id: User ID for consistent per-user shuffle (optional)
+
+        Returns:
+            List of post IDs from diverse categories (shuffled)
+        """
+        try:
+            import random
+            import hashlib
+            from datetime import date
+            
+            post_ids = []
+
+            # Fetch MORE than needed for variety after shuffling
+            fetch_limit = min(n * 5, 1000)  # Match the fetch strategy of category posts
+
+            # Get recent humanPosts ordered by date (no category filter)
+            human_posts = db.collection('humanPosts')\
+                .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                .limit(fetch_limit // 2)\
+                .stream()
+
+            for post in human_posts:
+                post_ids.append(post.id)
+
+            # Get recent aiPosts ordered by date (no category filter)
+            ai_posts = db.collection('aiPosts')\
+                .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                .limit(fetch_limit // 2)\
+                .stream()
+
+            for post in ai_posts:
+                post_ids.append(post.id)
+
+            # Deterministic shuffle based on user_id + current date
+            if user_id:
+                today = date.today().isoformat()
+                seed_string = f"{user_id}_diverse_{today}"
+                seed = int(hashlib.md5(seed_string.encode()).hexdigest(), 16) % (2**32)
+                random.seed(seed)
+            
+            random.shuffle(post_ids)
+            random.seed()  # Reset to random seed
+
+            print(f"[Firestore] Found {len(post_ids)} diverse exploration posts (shuffled)")
+            return post_ids[:n]
+
+        except Exception as e:
+            print(f"[Firestore] Error getting diverse posts: {e}")
+            return []
 
     def get_items_by_label(self, label: str, n: int = 100) -> List[str]:
         """
@@ -427,6 +620,299 @@ class GorseClient:
 
         return recommendations[:n]
 
+    def get_smart_recommendations_with_ranking(self,
+                                               user_id: str,
+                                               user_labels: List[str],
+                                               n: int = 10,
+                                               target_match_rate: float = 0.7,
+                                               recency_weight: float = 0.5,
+                                               popularity_weight: float = 0.3) -> List[str]:
+        """
+        Get smart category-based recommendations with recency and popularity ranking
+
+        This enhanced version:
+        1. Filters items by user's category labels
+        2. Scores each item by recency (newer = higher score)
+        3. Scores each item by popularity (likes + comments)
+        4. Combines scores and ranks items
+        5. Blends top-ranked items with diverse recommendations
+
+        Args:
+            user_id: User ID to get recommendations for
+            user_labels: List of category labels the user is interested in
+            n: Total number of recommendations to return
+            target_match_rate: Target percentage from user's categories (0.0-1.0)
+            recency_weight: Weight for recency score (0.0-1.0, default 0.5)
+            popularity_weight: Weight for popularity score (0.0-1.0, default 0.3)
+
+        Returns:
+            List of recommended item IDs, ranked by combined score
+        """
+        # NOTE: This method is Firestore-only and does NOT require Gorse to be enabled
+        # It works independently for cold start recommendations
+
+        import math
+        from datetime import datetime, timezone, timedelta
+
+        recommendations = []
+
+        # Get user's viewed posts to filter them out
+        viewed_posts = self.get_user_viewed_posts(user_id, feedback_type='read')
+        viewed_posts_set = set(viewed_posts)
+
+        # Collect items from user's interest categories (100% category-based)
+        category_items = []
+        items_per_category = max(200, n * 5)  # Fetch MUCH more for variety (5x instead of 3x)
+
+        print(f"[SmartRecs] Fetching items for {len(user_labels)} labels...")
+        for label in user_labels:
+            items = self.get_items_by_label_firestore(label, n=items_per_category, user_id=user_id)
+            category_items.extend(items)
+
+        # Remove duplicates
+        category_items = list(set(category_items))
+        print(f"[SmartRecs] Found {len(category_items)} unique category items (before filtering viewed)")
+
+        # Filter out already viewed posts
+        category_items = [item_id for item_id in category_items if item_id not in viewed_posts_set]
+        print(f"[SmartRecs] After filtering viewed posts: {len(category_items)} items remaining")
+
+        # If we don't have enough posts from user's categories, fetch random posts from ANY category
+        if len(category_items) < n:
+            needed = n - len(category_items)
+            print(f"[SmartRecs] Not enough category posts ({len(category_items)}/{n}), fetching {needed} random posts from any category...")
+            
+            # Fetch diverse posts (no category filter)
+            random_items = self.get_diverse_posts_firestore(n=needed * 3, user_id=user_id)  # Fetch 3x for filtering
+            
+            # Remove duplicates and already viewed
+            random_items = [item_id for item_id in random_items if item_id not in viewed_posts_set and item_id not in category_items]
+            
+            if random_items:
+                category_items.extend(random_items[:needed])  # Add only what we need
+                print(f"[SmartRecs] Added {len(random_items[:needed])} random posts, total now: {len(category_items)}")
+            else:
+                print(f"[SmartRecs] No random posts available after filtering")
+
+        # Score each item by recency and popularity
+        # OPTIMIZATION: Batch fetch posts to reduce Firestore queries
+        scored_items = []
+        
+        print(f"[SmartRecs] Batch fetching {len(category_items)} posts...")
+        
+        # Batch fetch all posts (up to 500 at a time due to Firestore limits)
+        posts_data = {}
+        batch_size = 500
+        
+        for i in range(0, len(category_items), batch_size):
+            batch_items = category_items[i:i+batch_size]
+            
+            # Try humanPosts first in parallel
+            human_refs = [db.collection('humanPosts').document(item_id) for item_id in batch_items]
+            human_docs = db.get_all(human_refs)
+            
+            for doc in human_docs:
+                if doc.exists:
+                    posts_data[doc.id] = (doc.to_dict(), True)  # True = is_human_post
+            
+            # For items not found in humanPosts, try aiPosts
+            missing_items = [item_id for item_id in batch_items if item_id not in posts_data]
+            if missing_items:
+                ai_refs = [db.collection('aiPosts').document(item_id) for item_id in missing_items]
+                ai_docs = db.get_all(ai_refs)
+                
+                for doc in ai_docs:
+                    if doc.exists:
+                        posts_data[doc.id] = (doc.to_dict(), False)  # False = is_ai_post
+        
+        print(f"[SmartRecs] Fetched {len(posts_data)} posts, now scoring...")
+
+        for item_id in category_items:
+            try:
+                if item_id not in posts_data:
+                    continue
+                
+                post_data, is_human_post = posts_data[item_id]
+
+                # Calculate Recency Score (exponential decay)
+                post_date = post_data.get('date_posted')
+                recency_score = 0.5  # Default
+
+                if post_date:
+                    try:
+                        # Handle Firestore timestamp
+                        if hasattr(post_date, 'timestamp'):
+                            post_datetime = datetime.fromtimestamp(post_date.timestamp(), tz=timezone.utc)
+                        else:
+                            post_datetime = post_date
+
+                        days_old = (datetime.now(timezone.utc) - post_datetime).days
+
+                        # Exponential decay: e^(-days_old * decay_rate)
+                        # Half-life of ~7 days with recency_weight=0.5
+                        decay_rate = recency_weight / 7.0
+                        recency_score = math.exp(-days_old * decay_rate)
+
+                    except Exception as e:
+                        pass  # Use default recency_score
+
+                # Calculate Popularity Score (engagement)
+                likes = post_data.get('likes', 0)
+                comments = post_data.get('comments', [])
+                comments_count = len(comments) if isinstance(comments, list) else 0
+
+                # Log scale for popularity (handles viral posts)
+                # Comments weighted 2x more than likes
+                engagement_score = math.log(1 + likes) + math.log(1 + comments_count * 2)
+
+                # Normalize engagement score (divide by 10 to keep in 0-1 range)
+                popularity_score = min(1.0, engagement_score / 10.0)
+
+                # HUMAN POST BOOST: Posts from human users get significant boost
+                if is_human_post:
+                    # Boost human posts by 20%
+                    human_boost = 0.2
+                    popularity_score = min(1.0, popularity_score * (1 + human_boost))
+
+                # MEDIA BOOST: Posts with images/videos get additional boost
+                has_video = post_data.get('has_video', False)
+                has_image = post_data.get('has_image', False)
+
+                if has_video:
+                    # Video posts get 10% boost
+                    video_boost = 0.1
+                    popularity_score = min(1.0, popularity_score * (1 + video_boost))
+                elif has_image:
+                    # Image posts get 5% boost
+                    image_boost = 0.05
+                    popularity_score = min(1.0, popularity_score * (1 + image_boost))
+
+                # Calculate Category Match Score
+                # Posts matching more of user's interests get higher scores
+                post_categories = post_data.get('masterCategories', [])
+                if not post_categories:
+                    post_categories = post_data.get('category', [])
+
+                # Count how many user interests this post matches
+                matching_categories = set(user_labels) & set(post_categories)
+                match_count = len(matching_categories)
+
+                # Normalize by number of user interests (0-1 scale)
+                # More matches = higher score
+                if len(user_labels) > 0:
+                    category_score = match_count / len(user_labels)
+                else:
+                    category_score = 0.5  # Default if no user labels
+
+                # Ensure minimum score of 0.2 for any categorized post
+                category_score = max(0.2, category_score)
+
+                # Combined Score
+                # recency_weight controls importance of freshness
+                # popularity_weight controls importance of engagement
+                # (1 - recency_weight - popularity_weight) goes to category matching
+                category_weight = 1.0 - recency_weight - popularity_weight
+                final_score = (
+                    recency_score * recency_weight +
+                    popularity_score * popularity_weight +
+                    category_score * category_weight
+                )
+
+                # INFLUENCER BOOST: Independent multiplier on final score (not just popularity)
+                is_influencer = post_data.get('is_influencer', False)
+                if is_influencer:
+                    # Boost entire final score by 30%
+                    influencer_boost = 0.3
+                    final_score = min(1.0, final_score * (1 + influencer_boost))
+                    print(f"[SmartRecs] Influencer boost applied to {item_id[:15]}... (final: {final_score:.3f})")
+
+                scored_items.append((item_id, final_score, recency_score, popularity_score, category_score))
+
+            except Exception as e:
+                print(f"[SmartRecs] Error scoring item {item_id}: {e}")
+                continue
+
+        # Sort by combined score (descending)
+        scored_items.sort(key=lambda x: x[1], reverse=True)
+
+        print(f"[SmartRecs] Scored {len(scored_items)} items")
+
+        # Show top 3 scores for debugging
+        if scored_items:
+            print(f"[SmartRecs] Top 3 scores:")
+            for i, (item_id, final, recency, popularity, category) in enumerate(scored_items[:3]):
+                print(f"  {i+1}. {item_id[:15]}... | Score: {final:.3f} (R:{recency:.2f}, P:{popularity:.2f}, C:{category:.2f})")
+
+        # Take top N items based on score
+        recommendations.extend([item_id for item_id, _, _, _, _ in scored_items[:n]])
+
+        print(f"[SmartRecs] Returning {len(recommendations)} recommendations")
+
+        # FALLBACK: If still empty or insufficient, allow re-showing viewed posts
+        if len(recommendations) < n:
+            print(f"[SmartRecs] WARNING: Only found {len(recommendations)} unviewed posts, need {n}")
+            print(f"[SmartRecs] Falling back to re-showing previously viewed content...")
+
+            # Re-fetch category items WITHOUT filtering (using Firestore)
+            fallback_items = []
+            for label in user_labels:
+                items = self.get_items_by_label_firestore(label, n=items_per_category)
+                fallback_items.extend(items)
+
+            fallback_items = list(set(fallback_items))
+
+            # Score fallback items (same logic as before, but without filtering)
+            fallback_scored = []
+            for item_id in fallback_items:
+                if item_id in recommendations:
+                    continue  # Skip items already added
+
+                try:
+                    post_ref = db.collection('humanPosts').document(item_id)
+                    post_doc = post_ref.get()
+
+                    if not post_doc.exists:
+                        post_ref = db.collection('aiPosts').document(item_id)
+                        post_doc = post_ref.get()
+
+                    if not post_doc.exists:
+                        continue
+
+                    post_data = post_doc.to_dict()
+
+                    # Simple scoring for fallback (just use recency)
+                    post_date = post_data.get('date_posted')
+                    if post_date:
+                        try:
+                            if hasattr(post_date, 'timestamp'):
+                                post_datetime = datetime.fromtimestamp(post_date.timestamp(), tz=timezone.utc)
+                            else:
+                                post_datetime = post_date
+
+                            days_old = (datetime.now(timezone.utc) - post_datetime).days
+                            decay_rate = recency_weight / 7.0
+                            recency_score = math.exp(-days_old * decay_rate)
+
+                            fallback_scored.append((item_id, recency_score))
+                        except:
+                            pass
+
+                except Exception as e:
+                    continue
+
+            # Sort by recency and add to recommendations
+            fallback_scored.sort(key=lambda x: x[1], reverse=True)
+            for item_id, _ in fallback_scored:
+                if item_id not in recommendations:
+                    recommendations.append(item_id)
+                    if len(recommendations) >= n:
+                        break
+
+            print(f"[SmartRecs] Added {len(recommendations)} posts total (including {len(recommendations) - len([r for r in recommendations if r not in viewed_posts_set])} re-shown posts)")
+
+        print(f"[SmartRecs] Returning {len(recommendations)} recommendations")
+        return recommendations[:n]
+
     def verify_match_rate(self,
                          recommendations: List[str],
                          user_labels: List[str]) -> dict:
@@ -491,6 +977,96 @@ class GorseClient:
             'unmatched_items': unmatched_items
         }
 
+    def restore_from_firestore(self, user_id: str = None, days_back: int = 30):
+        """
+        Restore user feedback from Firestore backup to Gorse
+
+        USE CASE: Disaster recovery when Gorse crashes or loses data
+
+        Args:
+            user_id: Specific user to restore (None = all users)
+            days_back: How many days of history to restore (default 30)
+
+        Returns:
+            Dictionary with restoration statistics
+        """
+        if not self.enabled:
+            print("[Restore] Gorse is disabled, skipping restore")
+            return {'success': False, 'error': 'Gorse disabled'}
+
+        print(f"[Restore] Starting Gorse restoration from Firestore backup...")
+        print(f"[Restore] Target: {'All users' if not user_id else f'User {user_id}'}, Days: {days_back}")
+
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=days_back)
+        restored_count = 0
+        error_count = 0
+        users_processed = set()
+
+        try:
+            # Get users to restore
+            if user_id:
+                user_docs = [db.collection('userFeedback').document(user_id)]
+            else:
+                user_docs = db.collection('userFeedback').stream()
+
+            for user_doc in user_docs:
+                current_user_id = user_doc.id if hasattr(user_doc, 'id') else user_id
+                users_processed.add(current_user_id)
+
+                # Get interactions for this user
+                interactions_ref = db.collection('userFeedback').document(current_user_id).collection('interactions')
+                interactions = interactions_ref.where('timestamp', '>=', cutoff_time).stream()
+
+                for interaction in interactions:
+                    try:
+                        data = interaction.to_dict()
+                        feedback_type = data.get('feedbackType')
+                        post_id = data.get('postId')
+                        timestamp = data.get('isoTimestamp')
+
+                        if not all([feedback_type, post_id, timestamp]):
+                            continue
+
+                        # Write to Gorse
+                        feedback_list = [{
+                            'FeedbackType': feedback_type,
+                            'UserId': current_user_id,
+                            'ItemId': post_id,
+                            'Timestamp': timestamp
+                        }]
+
+                        response = requests.put(
+                            f'{self.api_url}/api/feedback',
+                            headers=self.headers,
+                            json=feedback_list,
+                            timeout=5
+                        )
+
+                        if response.status_code in [200, 201]:
+                            restored_count += 1
+                        else:
+                            error_count += 1
+
+                    except Exception as e:
+                        error_count += 1
+                        print(f"[Restore] Error restoring interaction: {e}")
+
+                print(f"[Restore] Processed user {current_user_id[:15]}...")
+
+            print(f"[Restore] ✅ Restoration complete!")
+            print(f"[Restore] Users: {len(users_processed)}, Restored: {restored_count}, Errors: {error_count}")
+
+            return {
+                'success': True,
+                'users_processed': len(users_processed),
+                'interactions_restored': restored_count,
+                'errors': error_count
+            }
+
+        except Exception as e:
+            print(f"[Restore] ⚠️ Restoration failed: {e}")
+            return {'success': False, 'error': str(e)}
+
 
 # Initialize Gorse client
 GORSE_API_URL = os.getenv('GORSE_API_URL', 'http://localhost:8087')
@@ -509,13 +1085,13 @@ from category_mapper import CategoryMapper
 
 # Initialize CategoryMapper once at startup (model loading is expensive)
 # similarity_threshold=0.35: Only assign categories with similarity >= 0.35
-# min_categories=1: At least 1 category per user/post
-# max_categories=5: At most 5 categories per user/post
+# min_categories=1: At least 1 category per post
+# max_categories=4: At most 4 categories per post (top 4 by similarity)
 try:
     category_mapper = CategoryMapper(
         similarity_threshold=0.35,
         min_categories=1,
-        max_categories=5
+        max_categories=4
     )
     print("✓ Category Mapper initialized successfully")
     CATEGORY_MAPPER_ENABLED = True
@@ -524,6 +1100,46 @@ except Exception as e:
     print("  Raw labels will be used without mapping")
     category_mapper = None
     CATEGORY_MAPPER_ENABLED = False
+
+print("="*70 + "\n")
+
+# Load topic-to-category mapping from Firestore for user interests
+print("Loading topic-to-category mapping from Firestore...")
+TOPIC_TO_CATEGORY_MAP = {}
+try:
+    doc_ref = db.collection('content').document('categories')
+    doc = doc_ref.get()
+
+    if doc.exists:
+        data = doc.to_dict()
+        categories = data.get('categories', {})
+
+        for category_name, topics in categories.items():
+            if isinstance(topics, list):
+                # Remove emoji and normalize the category name
+                # Keep only basic ASCII alphanumeric and spaces/ampersands
+                category_no_emoji = ''.join(char for char in category_name if ord(char) < 128 or char.isalpha())
+                category_no_emoji = category_no_emoji.strip()
+
+                # Normalize: lowercase, replace separators, remove special chars, strip underscores
+                normalized_category = category_no_emoji.lower()
+                normalized_category = normalized_category.replace(' & ', '_').replace('&', '_')
+                normalized_category = normalized_category.replace(' ', '_').replace('-', '_')
+                normalized_category = normalized_category.replace(',', '').replace('.', '')
+                # Remove any consecutive underscores and strip leading/trailing underscores
+                while '__' in normalized_category:
+                    normalized_category = normalized_category.replace('__', '_')
+                normalized_category = normalized_category.strip('_')
+
+                for topic in topics:
+                    topic_key = str(topic).lower().strip()
+                    TOPIC_TO_CATEGORY_MAP[topic_key] = normalized_category
+
+        print(f"✓ Loaded {len(TOPIC_TO_CATEGORY_MAP)} topic mappings from {len(categories)} categories")
+    else:
+        print("⚠ Warning: No categories document found in Firestore")
+except Exception as e:
+    print(f"⚠ Warning: Failed to load topic mapping: {e}")
 
 print("="*70 + "\n")
 
@@ -1612,20 +2228,34 @@ def update_interests():
         if not user_id or interests is None:
             return jsonify({"success": False, "error": "User Id and Interests are required"}), 400
 
-        # Map raw interests to master categories using CategoryMapper
-        master_categories = interests  # Default: use raw interests
-        if CATEGORY_MAPPER_ENABLED and category_mapper and interests:
-            try:
-                master_categories = category_mapper.map_labels_to_categories(interests)
-                print(f"   Mapped to master categories: {master_categories}")
-            except Exception as e:
-                print(f"⚠ Warning: Failed to map categories, using raw interests: {e}")
-                master_categories = interests
+        # Map raw interests to master categories using direct topic mapping
+        master_categories = set()  # Use set to avoid duplicates
+        unmapped_interests = []
+
+        if interests and TOPIC_TO_CATEGORY_MAP:
+            for interest in interests:
+                interest_key = str(interest).lower().strip()
+                if interest_key in TOPIC_TO_CATEGORY_MAP:
+                    master_categories.add(TOPIC_TO_CATEGORY_MAP[interest_key])
+                else:
+                    unmapped_interests.append(interest)
+
+            # Convert set to sorted list for consistent ordering
+            master_categories = sorted(list(master_categories))
+            print(f"   Mapped to master categories: {master_categories}")
+
+            if unmapped_interests:
+                print(f"   ⚠ Unmapped interests: {unmapped_interests}")
+        else:
+            # Fallback: use raw interests if no mapping available
+            master_categories = interests if interests else []
+            print(f"   No topic mapping available, using raw interests")
 
         # Update the document in Firestore with BOTH raw and mapped interests
         db.collection('humanUsers').document(user_id).update({
             "user_interests": interests,  # Original interests for display
-            "interests": master_categories  # Mapped master categories for Gorse
+            "interests": interests,  # Keep raw interests in 'interests' field
+            "masterCategories": master_categories  # Mapped master categories
         })
         print(f"✓ Updated interests in Firestore for user {user_id}")
 
@@ -3207,7 +3837,7 @@ def create_human_post():
                 master_categories = categories
 
         # Store both raw and mapped categories in post_data
-        post_data["master_categories"] = master_categories
+        post_data["masterCategories"] = master_categories
 
         db.collection('humanPosts').document(data.get("Id")).set(post_data)
 
@@ -3283,7 +3913,7 @@ def create_ai_post():
                 master_categories = categories
 
         # Store both raw and mapped categories in post_data
-        post_data["master_categories"] = master_categories
+        post_data["masterCategories"] = master_categories
 
         doc_ref = db.collection('aiPosts').document()
         post_id = doc_ref.id
@@ -3464,7 +4094,7 @@ def create_repost():
             "ai_name": data.get("AIName"),
             "ai_profile_image_url": data.get("AIProfileImageURL"),
             "category": categories,
-            "master_categories": master_categories,
+            "masterCategories": master_categories,
             "comments": [],
             "date_posted": firestore.SERVER_TIMESTAMP,
             "likes": 0,
@@ -3621,37 +4251,95 @@ def get_smart_recommendations():
             return jsonify({"success": False, "error": "User not found"}), 404
 
         user_data = user_doc.to_dict()
-        user_labels = user_data.get('interests', []) or user_data.get('labels', []) or []
+
+        # CRITICAL FIX: Use masterCategories field for consistent matching
+        # masterCategories are mapped from user interests and match post labels in Gorse
+        user_labels = user_data.get('masterCategories', [])
+
+        # Fallback to interests if masterCategories not yet populated
+        if not user_labels:
+            user_labels = user_data.get('interests', [])
+            print(f"⚠ User {user_id} missing masterCategories, using raw interests")
+
+        # DEFAULT CATEGORIES: If user has no interests, use beginner-friendly categories
+        # These categories have broad appeal and high engagement
+        DEFAULT_COLD_START_CATEGORIES = [
+            "entertainment_memes",      # Universal appeal
+            "learning_education",       # Educational content
+            "creativity_art",           # Visual content
+            "pets_wildlife",           # Animal content (highly engaging)
+            "travel_adventure"         # Aspirational content
+        ]
 
         if not user_labels:
-            # Fallback to regular recommendations if user has no labels
-            post_ids = gorse_client.get_recommendations(user_id, limit=limit)
+            print(f"📌 User {user_id} has no interests, using default cold start categories")
+            user_labels = DEFAULT_COLD_START_CATEGORIES
+
+        # PHASE 2: Use ranking by default (recency + popularity)
+        # To disable ranking, pass use_ranking=false in request
+        use_ranking = data.get('use_ranking', True)
+
+        # PAGINATION FIX: Cap at 30 posts to avoid timeout
+        # Even if Flutter requests 100, we only return 30 (fast response)
+        MAX_POOL_SIZE = 30  # Cap to prevent timeout
+        total_pool_size = min(limit, MAX_POOL_SIZE)  # Use smaller of requested or max
+
+        if use_ranking:
+            # Get smart recommendations WITH recency and popularity ranking
+            recommendations = gorse_client.get_smart_recommendations_with_ranking(
+                user_id=user_id,
+                user_labels=user_labels,
+                n=total_pool_size,  # Get large pool for pagination
+                target_match_rate=target_match_rate,
+                recency_weight=0.3,
+                popularity_weight=0.35
+            )
+            method = "smart_category_ranked"
+        else:
+            # Get smart recommendations WITHOUT ranking
+            recommendations = gorse_client.get_smart_recommendations(
+                user_id=user_id,
+                user_labels=user_labels,
+                n=total_pool_size,  # Get large pool for pagination
+                target_match_rate=target_match_rate,
+                shuffle=True
+            )
+            method = "smart_category_basic"
+
+        print(f"[SmartRecs] Generated pool of {len(recommendations)} post IDs (requested limit: {limit})")
+
+        if len(recommendations) == 0:
+            print(f"[SmartRecs] WARNING: No recommendations generated! Check if posts exist in user's categories")
             return jsonify({
-                "success": True,
-                "data": {
-                    "recommendations": post_ids,
-                    "method": "fallback_general",
-                    "message": "User has no interest labels, using general recommendations"
-                }
+                "success": False,
+                "error": "No recommendations available",
+                "recommendations": [],
+                "data": {"user_labels": user_labels, "total": 0}
             }), 200
 
-        # Get smart category-based recommendations
-        recommendations = gorse_client.get_smart_recommendations(
-            user_id=user_id,
-            user_labels=user_labels,
-            n=limit,
-            target_match_rate=target_match_rate,
-            shuffle=True
-        )
+        # Convert post IDs to full post objects for Flutter app
+        all_post_objects = get_posts_by_ids(recommendations)
+
+        # Filter out None values (posts that don't exist in Firestore)
+        post_objects = [p for p in all_post_objects if p is not None]
+        print(f"[SmartRecs] Fetched {len(post_objects)} valid post objects (out of {len(all_post_objects)} requested)")
+
+        if len(post_objects) == 0:
+            print("[SmartRecs] WARNING: No valid post objects! Posts may not exist in Firestore")
+        else:
+            first_ids = [p.get('id', '?')[:15] for p in post_objects[:3]]
+            print(f"[SmartRecs] First 3 IDs: {first_ids}")
 
         result = {
             "success": True,
+            "recommendations": post_objects,  # Flutter expects this key with full post objects
             "data": {
-                "recommendations": recommendations,
+                "post_ids": recommendations,  # Keep IDs for reference
                 "user_labels": user_labels,
-                "total": len(recommendations),
+                "total": len(post_objects),
                 "target_match_rate": target_match_rate,
-                "method": "smart_category_based"
+                "method": method,
+                "ranking_enabled": use_ranking
             }
         }
 
@@ -3970,18 +4658,147 @@ def get_post_from_firestore_by_id(post_id):
         # Try humanPosts first
         post_doc = db.collection('humanPosts').document(post_id).get()
         if post_doc.exists:
-            return post_doc.to_dict()
-        
+            post_data = post_doc.to_dict()
+            post_data['id'] = post_id  # Add document ID to the dict
+            return post_data
+
         # Try aiPosts
         post_doc = db.collection('aiPosts').document(post_id).get()
         if post_doc.exists:
-            return post_doc.to_dict()
-        
+            post_data = post_doc.to_dict()
+            post_data['id'] = post_id  # Add document ID to the dict
+            post_data['is_ai'] = True  # Mark as AI post for Flutter identification
+            
+            # Enrich AI posts with user profile information using character_info
+            # Flutter's PostCard checks character_info['image'] for profile pictures
+            user_name = post_data.get('user_name')
+            if user_name:
+                try:
+                    # Try aiUsers collection first
+                    ai_user_doc = db.collection('aiUsers').document(user_name).get()
+                    profile_pic_url = None
+                    
+                    if ai_user_doc.exists:
+                        ai_user_data = ai_user_doc.to_dict()
+                        # Check all possible field names for profile picture
+                        profile_pic_url = (
+                            ai_user_data.get('profile_picture_url') or 
+                            ai_user_data.get('profilePicture') or 
+                            ai_user_data.get('profile_picture')
+                        )
+                        print(f"✅ Found AI user '{user_name}' in aiUsers, profile_pic: {profile_pic_url[:50] if profile_pic_url else 'None'}...")
+                    else:
+                        # Try popularCharacters collection as fallback
+                        char_doc = db.collection('popularCharacters').document(user_name).get()
+                        if char_doc.exists:
+                            char_data = char_doc.to_dict()
+                            profile_pic_url = (
+                                char_data.get('profile_picture_url') or
+                                char_data.get('profilePicture') or 
+                                char_data.get('profile_picture')
+                            )
+                            print(f"✅ Found AI user '{user_name}' in popularCharacters, profile_pic: {profile_pic_url[:50] if profile_pic_url else 'None'}...")
+                    
+                    # Add to character_info so Flutter's PostCard can use it
+                    if profile_pic_url and profile_pic_url != 'url_to_profile_picture':
+                        post_data['character_info'] = {
+                            'name': user_name,
+                            'image': profile_pic_url
+                        }
+                        print(f"✅ Enriched AI post {post_id} with character_info for {user_name}")
+                    else:
+                        print(f"⚠️  No valid profile picture URL for AI user '{user_name}' (value: {profile_pic_url})")
+                        
+                except Exception as e:
+                    print(f"⚠️  Error enriching AI post {post_id}: {e}")
+            else:
+                print(f"⚠️  AI post {post_id} missing user_name field")
+            
+            return post_data
+
         # Try reposts
         post_doc = db.collection('reposts').document(post_id).get()
         if post_doc.exists:
-            return post_doc.to_dict()
-        
+            post_data = post_doc.to_dict()
+            post_data['id'] = post_id  # Add document ID to the dict
+            return post_data
+
+        return None
+    except Exception as e:
+        print(f"Error fetching post {post_id}: {e}")
+        return None
+
+
+def get_post_from_firestore_by_id_cached(post_id: str, ai_user_cache: dict) -> dict:
+    """
+    Optimized version of get_post_from_firestore_by_id that uses a cache for AI user profiles.
+    This significantly speeds up batch post fetching by avoiding repeated Firestore queries.
+    """
+    try:
+        # Try humanPosts first
+        post_doc = db.collection('humanPosts').document(post_id).get()
+        if post_doc.exists:
+            post_data = post_doc.to_dict()
+            post_data['id'] = post_id
+            return post_data
+
+        # Try aiPosts with cached profile enrichment
+        post_doc = db.collection('aiPosts').document(post_id).get()
+        if post_doc.exists:
+            post_data = post_doc.to_dict()
+            post_data['id'] = post_id
+            post_data['is_ai'] = True
+            
+            # Enrich AI posts with cached user profile information
+            user_name = post_data.get('user_name')
+            if user_name:
+                # Check cache first
+                if user_name in ai_user_cache:
+                    profile_pic_url = ai_user_cache[user_name]
+                else:
+                    # Not in cache, fetch from Firestore and cache it
+                    profile_pic_url = None
+                    try:
+                        ai_user_doc = db.collection('aiUsers').document(user_name).get()
+                        if ai_user_doc.exists:
+                            ai_user_data = ai_user_doc.to_dict()
+                            profile_pic_url = (
+                                ai_user_data.get('profile_picture_url') or 
+                                ai_user_data.get('profilePicture') or 
+                                ai_user_data.get('profile_picture')
+                            )
+                        else:
+                            # Try popularCharacters as fallback
+                            char_doc = db.collection('popularCharacters').document(user_name).get()
+                            if char_doc.exists:
+                                char_data = char_doc.to_dict()
+                                profile_pic_url = (
+                                    char_data.get('profile_picture_url') or
+                                    char_data.get('profilePicture') or 
+                                    char_data.get('profile_picture')
+                                )
+                    except Exception as e:
+                        profile_pic_url = None
+                    
+                    # Cache the result (even if None, to avoid repeated failed lookups)
+                    ai_user_cache[user_name] = profile_pic_url
+                
+                # Add to character_info if we have a valid URL
+                if profile_pic_url and profile_pic_url != 'url_to_profile_picture':
+                    post_data['character_info'] = {
+                        'name': user_name,
+                        'image': profile_pic_url
+                    }
+            
+            return post_data
+
+        # Try reposts
+        post_doc = db.collection('reposts').document(post_id).get()
+        if post_doc.exists:
+            post_data = post_doc.to_dict()
+            post_data['id'] = post_id
+            return post_data
+
         return None
     except Exception as e:
         print(f"Error fetching post {post_id}: {e}")
@@ -3989,12 +4806,15 @@ def get_post_from_firestore_by_id(post_id):
 
 
 def get_posts_by_ids(post_ids: List[str]) -> List[dict]:
-    """Fetch multiple posts from Firestore by their IDs"""
+    """Fetch multiple posts from Firestore by their IDs with optimized AI user profile caching"""
     posts = []
+    ai_user_cache = {}  # Cache AI user profiles to avoid repeated Firestore queries
+    
     for post_id in post_ids:
-        post_data = get_post_from_firestore_by_id(post_id)
+        post_data = get_post_from_firestore_by_id_cached(post_id, ai_user_cache)
         if post_data:
             posts.append(post_data)
+    
     return posts
 
 # ---------------------------
@@ -5636,6 +6456,11 @@ def get_ai_profile():
             return jsonify({"success": False, "error": "User not found"}), 404
 
         user_data = user_doc.to_dict()
+
+        # Transform field names to match Flutter expectations
+        if 'profile_picture_url' in user_data:
+            user_data['profilePicture'] = user_data['profile_picture_url']
+
         return jsonify({"success": True, "data": user_data}), 200
     except Exception as ex:
         logger.error("Error retrieving profile: %s", ex)

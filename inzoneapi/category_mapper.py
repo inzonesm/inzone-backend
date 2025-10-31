@@ -82,16 +82,19 @@ class CategoryMapper:
         
         # Filter by threshold and apply min/max limits
         filtered_categories = [
-            cat for cat, sim in sorted_categories 
+            cat for cat, sim in sorted_categories
             if sim >= self.similarity_threshold
         ]
-        
+
         # Ensure we have at least min_categories (take top ones even if below threshold)
         if len(filtered_categories) < self.min_categories:
             filtered_categories = [cat for cat, sim in sorted_categories[:self.min_categories]]
-        
-        # Limit to max_categories
-        result_categories = filtered_categories[:self.max_categories]
+
+        # Limit to max_categories (if specified)
+        if self.max_categories is not None:
+            result_categories = filtered_categories[:self.max_categories]
+        else:
+            result_categories = filtered_categories
         
         if verbose:
             print(f"\n  Original labels: {labels}")
