@@ -91,6 +91,89 @@ inzone_ai_service = InZoneAIEngagementService(db, client)
 ai_engagement_scheduler = AIEngagementScheduler(inzone_ai_service)
 
 # ---------------------------
+# Feed Recommendation Configuration
+# ---------------------------
+
+class FeedRecommendationConfig:
+    """
+    Real-time adjustable configuration for feed recommendation algorithm.
+    Allows fine-tuning of scoring weights and boosts without restarting the server.
+    """
+    def __init__(self):
+        # Scoring weights (should sum to ~1.0)
+        self.recency_weight = 0.3      # How much to value fresh content
+        self.popularity_weight = 0.35  # How much to value engagement (likes, comments)
+        self.category_weight = 0.35    # How much to value category matching
+
+        # Content type boosts (multipliers on popularity score)
+        self.video_boost = 0.1         # Boost for video posts (+10%)
+        self.image_boost = 0.05        # Boost for image posts (+5%)
+        self.text_boost = 0.0          # Boost for text-only posts (can boost to promote text)
+
+        # User type boosts
+        self.human_boost = 0.2         # Boost for posts from human users
+        self.influencer_boost = 0.3    # Boost for posts from influencers (applied to final score)
+
+        # Diversity settings
+        self.enable_media_diversity = True  # Enable media type mixing
+        self.diversity_strength = 1.0       # How aggressively to mix media types (0.0-2.0)
+
+    def to_dict(self):
+        """Export config as dictionary for API responses"""
+        return {
+            'weights': {
+                'recency': self.recency_weight,
+                'popularity': self.popularity_weight,
+                'category': self.category_weight,
+            },
+            'boosts': {
+                'video': self.video_boost,
+                'image': self.image_boost,
+                'text': self.text_boost,
+                'human': self.human_boost,
+                'influencer': self.influencer_boost,
+            },
+            'diversity': {
+                'enabled': self.enable_media_diversity,
+                'strength': self.diversity_strength,
+            }
+        }
+
+    def update_from_dict(self, config_dict):
+        """Update config from dictionary (for API updates)"""
+        if 'weights' in config_dict:
+            weights = config_dict['weights']
+            if 'recency' in weights:
+                self.recency_weight = float(weights['recency'])
+            if 'popularity' in weights:
+                self.popularity_weight = float(weights['popularity'])
+            if 'category' in weights:
+                self.category_weight = float(weights['category'])
+
+        if 'boosts' in config_dict:
+            boosts = config_dict['boosts']
+            if 'video' in boosts:
+                self.video_boost = float(boosts['video'])
+            if 'image' in boosts:
+                self.image_boost = float(boosts['image'])
+            if 'text' in boosts:
+                self.text_boost = float(boosts['text'])
+            if 'human' in boosts:
+                self.human_boost = float(boosts['human'])
+            if 'influencer' in boosts:
+                self.influencer_boost = float(boosts['influencer'])
+
+        if 'diversity' in config_dict:
+            diversity = config_dict['diversity']
+            if 'enabled' in diversity:
+                self.enable_media_diversity = bool(diversity['enabled'])
+            if 'strength' in diversity:
+                self.diversity_strength = float(diversity['strength'])
+
+# Global configuration instance
+feed_config = FeedRecommendationConfig()
+
+# ---------------------------
 # Gorse Recommendation System Client
 # ---------------------------
 
@@ -114,6 +197,11 @@ class GorseClient:
                 print("  ⚠ No API key set (may not be required)")
         else:
             print("⚠ Gorse client disabled (no valid URL or using localhost)")
+        
+        # BATCH CACHE: Store generated recommendations for each (user_id, batch_number) pair
+        # This ensures same batch always returns same posts, fixing scroll duplication
+        self.batch_cache = {}  # Key: f"{user_id}:{batch_number}" -> Value: list of post IDs
+        self.cache_max_size = 100  # Prevent unbounded growth
     
     def get_recommendations(self, user_id: str, limit: int = 20, offset: int = 0) -> List[str]:
         """Get personalized post recommendations for a user"""
@@ -394,25 +482,51 @@ class GorseClient:
             # For n=150 (from 30 * 5), fetch_limit will be min(750, 1000) = 750 posts
             fetch_limit = min(n * 5, 1000)  # Fetch 5x what we need, max 1000 (increased from 500)
 
-            # Query humanPosts with this category
-            # NOTE: Can't use order_by('date_posted') without composite index
-            # Instead, we fetch more posts and shuffle them
-            human_posts = db.collection('humanPosts')\
-                .where('masterCategories', 'array_contains', label)\
-                .limit(fetch_limit // 2)\
-                .stream()
+            # Query humanPosts with this category, ordered by timestamp
+            # This requires a composite index: (masterCategories, date_posted DESC)
+            # Create it in Firebase Console when prompted
+            try:
+                human_posts = db.collection('humanPosts')\
+                    .where('masterCategories', 'array_contains', label)\
+                    .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                    .limit(fetch_limit // 2)\
+                    .stream()
 
-            for post in human_posts:
-                post_ids.append(post.id)
+                for post in human_posts:
+                    post_ids.append(post.id)
+            except Exception as e:
+                # Fallback if index doesn't exist yet
+                print(f"[Firestore] Index may be needed for humanPosts ordering: {e}")
+                print(f"[Firestore] Falling back to unordered query...")
+                human_posts = db.collection('humanPosts')\
+                    .where('masterCategories', 'array_contains', label)\
+                    .limit(fetch_limit // 2)\
+                    .stream()
 
-            # Query aiPosts with this category
-            ai_posts = db.collection('aiPosts')\
-                .where('masterCategories', 'array_contains', label)\
-                .limit(fetch_limit // 2)\
-                .stream()
+                for post in human_posts:
+                    post_ids.append(post.id)
 
-            for post in ai_posts:
-                post_ids.append(post.id)
+            # Query aiPosts with this category, ordered by timestamp
+            try:
+                ai_posts = db.collection('aiPosts')\
+                    .where('masterCategories', 'array_contains', label)\
+                    .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                    .limit(fetch_limit // 2)\
+                    .stream()
+
+                for post in ai_posts:
+                    post_ids.append(post.id)
+            except Exception as e:
+                # Fallback if index doesn't exist yet
+                print(f"[Firestore] Index may be needed for aiPosts ordering: {e}")
+                print(f"[Firestore] Falling back to unordered query...")
+                ai_posts = db.collection('aiPosts')\
+                    .where('masterCategories', 'array_contains', label)\
+                    .limit(fetch_limit // 2)\
+                    .stream()
+
+                for post in ai_posts:
+                    post_ids.append(post.id)
 
             # Shuffle with deterministic seed based on user_id + current date
             # Same user gets same shuffle order on the same day (consistency)
@@ -626,7 +740,9 @@ class GorseClient:
                                                n: int = 10,
                                                target_match_rate: float = 0.7,
                                                recency_weight: float = 0.5,
-                                               popularity_weight: float = 0.3) -> List[str]:
+                                               popularity_weight: float = 0.3,
+                                               batch_number: int = 0,
+                                               exclude_ids: List[str] = None) -> List[str]:
         """
         Get smart category-based recommendations with recency and popularity ranking
 
@@ -654,28 +770,55 @@ class GorseClient:
         import math
         from datetime import datetime, timezone, timedelta
 
+        # BATCH CACHE: DISABLED - Always filter viewed posts on every request
+        # This ensures users never see already-viewed posts in their feed
+        cache_key = f"{user_id}:{batch_number}"
+
+        # CACHE DISABLED - Always generate fresh recommendations
+        # if cache_key in self.batch_cache:
+        #     cached_recommendations = self.batch_cache[cache_key]
+        #     print(f"[SmartRecs] 🎯 CACHE HIT! Returning cached batch {batch_number} ({len(cached_recommendations)} posts)")
+        #     return cached_recommendations
+
+        print(f"[SmartRecs] 🆕 Generating batch {batch_number} with fresh filtering")
+
         recommendations = []
 
         # Get user's viewed posts to filter them out
         viewed_posts = self.get_user_viewed_posts(user_id, feedback_type='read')
         viewed_posts_set = set(viewed_posts)
 
+        # Also exclude posts already loaded in client (prevents race conditions)
+        if exclude_ids is None:
+            exclude_ids = []
+        exclude_set = set(exclude_ids)
+
+        # Combine both sets for comprehensive filtering
+        all_excluded = viewed_posts_set | exclude_set
+
+        if exclude_set:
+            print(f"[SmartRecs] 🚫 Excluding {len(exclude_set)} client-loaded posts + {len(viewed_posts_set)} Firestore-viewed posts = {len(all_excluded)} total excluded")
+
         # Collect items from user's interest categories (100% category-based)
         category_items = []
         items_per_category = max(200, n * 5)  # Fetch MUCH more for variety (5x instead of 3x)
 
-        print(f"[SmartRecs] Fetching items for {len(user_labels)} labels...")
+        print(f"[SmartRecs] 🔍 User {user_id[:15]}... has viewed {len(viewed_posts)} posts total")
+        print(f"[SmartRecs] 🎯 Fetching items for {len(user_labels)} labels: {user_labels[:3]}...")
         for label in user_labels:
             items = self.get_items_by_label_firestore(label, n=items_per_category, user_id=user_id)
             category_items.extend(items)
 
         # Remove duplicates
         category_items = list(set(category_items))
-        print(f"[SmartRecs] Found {len(category_items)} unique category items (before filtering viewed)")
+        print(f"[SmartRecs] 📦 Found {len(category_items)} unique category items (before filtering viewed)")
 
-        # Filter out already viewed posts
-        category_items = [item_id for item_id in category_items if item_id not in viewed_posts_set]
-        print(f"[SmartRecs] After filtering viewed posts: {len(category_items)} items remaining")
+        # Filter out already viewed posts AND client-loaded posts
+        category_items_before = len(category_items)
+        category_items = [item_id for item_id in category_items if item_id not in all_excluded]
+        filtered_out = category_items_before - len(category_items)
+        print(f"[SmartRecs] ✂️  Filtered out {filtered_out} excluded posts (viewed + client-loaded)")
+        print(f"[SmartRecs] ✅ {len(category_items)} fresh posts remaining for recommendations")
 
         # If we don't have enough posts from user's categories, fetch random posts from ANY category
         if len(category_items) < n:
@@ -685,8 +828,8 @@ class GorseClient:
             # Fetch diverse posts (no category filter)
             random_items = self.get_diverse_posts_firestore(n=needed * 3, user_id=user_id)  # Fetch 3x for filtering
             
-            # Remove duplicates and already viewed
-            random_items = [item_id for item_id in random_items if item_id not in viewed_posts_set and item_id not in category_items]
+            # Remove duplicates and already excluded (viewed + client-loaded)
+            random_items = [item_id for item_id in random_items if item_id not in all_excluded and item_id not in category_items]
             
             if random_items:
                 category_items.extend(random_items[:needed])  # Add only what we need
@@ -768,24 +911,22 @@ class GorseClient:
                 # Normalize engagement score (divide by 10 to keep in 0-1 range)
                 popularity_score = min(1.0, engagement_score / 10.0)
 
-                # HUMAN POST BOOST: Posts from human users get significant boost
-                if is_human_post:
-                    # Boost human posts by 20%
-                    human_boost = 0.2
-                    popularity_score = min(1.0, popularity_score * (1 + human_boost))
+                # HUMAN POST BOOST: Posts from human users get configurable boost
+                if is_human_post and feed_config.human_boost > 0:
+                    popularity_score = min(1.0, popularity_score * (1 + feed_config.human_boost))
 
-                # MEDIA BOOST: Posts with images/videos get additional boost
+                # MEDIA BOOST: Posts with images/videos get configurable boost
+                # Can be disabled (set to 0.0) to prevent content clustering
                 has_video = post_data.get('has_video', False)
                 has_image = post_data.get('has_image', False)
 
-                if has_video:
-                    # Video posts get 10% boost
-                    video_boost = 0.1
-                    popularity_score = min(1.0, popularity_score * (1 + video_boost))
-                elif has_image:
-                    # Image posts get 5% boost
-                    image_boost = 0.05
-                    popularity_score = min(1.0, popularity_score * (1 + image_boost))
+                if has_video and feed_config.video_boost > 0:
+                    popularity_score = min(1.0, popularity_score * (1 + feed_config.video_boost))
+                elif has_image and feed_config.image_boost > 0:
+                    popularity_score = min(1.0, popularity_score * (1 + feed_config.image_boost))
+                elif not has_video and not has_image and feed_config.text_boost > 0:
+                    # Boost text-only posts if configured
+                    popularity_score = min(1.0, popularity_score * (1 + feed_config.text_boost))
 
                 # Calculate Category Match Score
                 # Posts matching more of user's interests get higher scores
@@ -818,12 +959,10 @@ class GorseClient:
                     category_score * category_weight
                 )
 
-                # INFLUENCER BOOST: Independent multiplier on final score (not just popularity)
+                # INFLUENCER BOOST: Independent multiplier on final score (configurable)
                 is_influencer = post_data.get('is_influencer', False)
-                if is_influencer:
-                    # Boost entire final score by 30%
-                    influencer_boost = 0.3
-                    final_score = min(1.0, final_score * (1 + influencer_boost))
+                if is_influencer and feed_config.influencer_boost > 0:
+                    final_score = min(1.0, final_score * (1 + feed_config.influencer_boost))
                     print(f"[SmartRecs] Influencer boost applied to {item_id[:15]}... (final: {final_score:.3f})")
 
                 scored_items.append((item_id, final_score, recency_score, popularity_score, category_score))
@@ -846,12 +985,118 @@ class GorseClient:
         # Take top N items based on score
         recommendations.extend([item_id for item_id, _, _, _, _ in scored_items[:n]])
 
+        # CONTENT DIVERSITY: Mix up media types (images, videos, text) for variety
+        # Group recommendations by media type, then interleave them
+        print(f"[SmartRecs] 🎨 Applying content diversity mixing...")
+        
+        # Categorize by media type
+        video_posts = []
+        image_posts = []
+        text_posts = []
+        
+        for item_id in recommendations:
+            if item_id in posts_data:
+                post_data, _ = posts_data[item_id]
+                has_video = post_data.get('has_video', False)
+                has_image = post_data.get('has_image', False)
+                
+                if has_video:
+                    video_posts.append(item_id)
+                elif has_image:
+                    image_posts.append(item_id)
+                else:
+                    text_posts.append(item_id)
+            else:
+                # If not in posts_data, treat as text post
+                text_posts.append(item_id)
+        
+        print(f"[SmartRecs] Media breakdown: {len(video_posts)} videos, {len(image_posts)} images, {len(text_posts)} text")
+        
+        # IMPROVED INTERLEAVING: Distribute media types evenly throughout the list
+        # Use weighted round-robin to ensure good mixing even with unbalanced counts
+        mixed_recommendations = []
+        total_posts = len(video_posts) + len(image_posts) + len(text_posts)
+        
+        if total_posts > 0:
+            # Calculate how often to insert each type (as a ratio)
+            video_ratio = len(video_posts) / total_posts if video_posts else 0
+            image_ratio = len(image_posts) / total_posts if image_posts else 0
+            text_ratio = len(text_posts) / total_posts if text_posts else 0
+            
+            # Track positions in each list
+            video_idx = 0
+            image_idx = 0
+            text_idx = 0
+            
+            # Use fractional counters for weighted distribution
+            video_counter = 0.0
+            image_counter = 0.0
+            text_counter = 0.0
+            
+            while len(mixed_recommendations) < total_posts:
+                # Add from the type with the highest counter
+                # This ensures proportional distribution
+                
+                if video_idx < len(video_posts):
+                    video_counter += video_ratio
+                if image_idx < len(image_posts):
+                    image_counter += image_ratio
+                if text_idx < len(text_posts):
+                    text_counter += text_ratio
+                
+                # Pick the type with highest counter and add one post
+                if video_counter >= image_counter and video_counter >= text_counter and video_idx < len(video_posts):
+                    mixed_recommendations.append(video_posts[video_idx])
+                    video_idx += 1
+                    video_counter -= 1.0
+                elif image_counter >= text_counter and image_idx < len(image_posts):
+                    mixed_recommendations.append(image_posts[image_idx])
+                    image_idx += 1
+                    image_counter -= 1.0
+                elif text_idx < len(text_posts):
+                    mixed_recommendations.append(text_posts[text_idx])
+                    text_idx += 1
+                    text_counter -= 1.0
+                else:
+                    # Safety: add any remaining posts
+                    if video_idx < len(video_posts):
+                        mixed_recommendations.append(video_posts[video_idx])
+                        video_idx += 1
+                    elif image_idx < len(image_posts):
+                        mixed_recommendations.append(image_posts[image_idx])
+                        image_idx += 1
+                    elif text_idx < len(text_posts):
+                        mixed_recommendations.append(text_posts[text_idx])
+                        text_idx += 1
+                    else:
+                        break  # All exhausted
+        
+        # Use mixed recommendations if we successfully categorized posts
+        if mixed_recommendations:
+            recommendations = mixed_recommendations[:n]
+            print(f"[SmartRecs] ✅ Mixed {len(recommendations)} posts by media type for variety")
+
+        # BATCH VARIATION: Apply rotation based on batch_number to give users variety
+        # This ensures different batches show different content without resetting viewed history
+        if batch_number > 0 and len(recommendations) > 2:
+            import random
+            # Use batch_number as seed for consistent but varied results
+            random.seed(batch_number)
+            # Rotate the list slightly (keep top 2 for smaller batches, shuffle rest)
+            top_items = recommendations[:2]  # Keep best 2 items at top (10-post batch)
+            remaining_items = recommendations[2:]
+            random.shuffle(remaining_items)
+            recommendations = top_items + remaining_items
+            print(f"[SmartRecs] 🔀 Applied batch variation (seed: {batch_number})")
+
         print(f"[SmartRecs] Returning {len(recommendations)} recommendations")
 
         # FALLBACK: If still empty or insufficient, allow re-showing viewed posts
         if len(recommendations) < n:
-            print(f"[SmartRecs] WARNING: Only found {len(recommendations)} unviewed posts, need {n}")
-            print(f"[SmartRecs] Falling back to re-showing previously viewed content...")
+            shortage = n - len(recommendations)
+            print(f"[SmartRecs] ⚠️  WARNING: Only found {len(recommendations)} unviewed posts, need {n}")
+            print(f"[SmartRecs] ⚠️  User has exhausted fresh content! Re-showing {shortage} previously viewed posts...")
+            print(f"[SmartRecs] 💡 SOLUTION: Add more posts to database OR wait for new content")
 
             # Re-fetch category items WITHOUT filtering (using Firestore)
             fallback_items = []
@@ -908,10 +1153,41 @@ class GorseClient:
                     if len(recommendations) >= n:
                         break
 
-            print(f"[SmartRecs] Added {len(recommendations)} posts total (including {len(recommendations) - len([r for r in recommendations if r not in viewed_posts_set])} re-shown posts)")
+            print(f"[SmartRecs] Added {len(recommendations)} posts total (including {len(recommendations) - len([r for r in recommendations if r not in all_excluded])} re-shown posts)")
 
-        print(f"[SmartRecs] Returning {len(recommendations)} recommendations")
-        return recommendations[:n]
+        # Final statistics
+        fresh_posts = len([r for r in recommendations if r not in all_excluded])
+        reshown_posts = len(recommendations) - fresh_posts
+        
+        if reshown_posts > 0:
+            print(f"[SmartRecs] 🔄 REPEAT WARNING: Returning {reshown_posts}/{len(recommendations)} previously viewed posts")
+            print(f"[SmartRecs] 📊 Stats: {fresh_posts} fresh + {reshown_posts} repeats = {len(recommendations)} total")
+        else:
+            print(f"[SmartRecs] ✅ SUCCESS: All {len(recommendations)} recommendations are fresh (never viewed before)")
+        
+        # PREPARE FINAL RECOMMENDATIONS
+        final_recommendations = recommendations[:n]
+
+        # DEBUG: Check for duplicates before returning
+        unique_recs = list(set(final_recommendations))
+        if len(unique_recs) != len(final_recommendations):
+            print(f"[SmartRecs] ⚠️  WARNING: Found {len(final_recommendations) - len(unique_recs)} duplicate posts in batch!")
+            print(f"[SmartRecs] Removing duplicates...")
+            final_recommendations = unique_recs[:n]  # Use unique list
+
+        # CACHE DISABLED - Do not store in cache
+        # self.batch_cache[cache_key] = final_recommendations
+        #
+        # # Prevent cache from growing indefinitely
+        # if len(self.batch_cache) > self.cache_max_size:
+        #     # Remove oldest entry (FIFO)
+        #     oldest_key = next(iter(self.batch_cache))
+        #     del self.batch_cache[oldest_key]
+        #     print(f"[SmartRecs] 🗑️ Cache cleanup: removed oldest batch")
+
+        print(f"[SmartRecs] ✅ Returning batch {batch_number} for user {user_id[:15]}... ({len(final_recommendations)} posts, all filtered fresh)")
+
+        return final_recommendations
 
     def verify_match_rate(self,
                          recommendations: List[str],
@@ -1074,33 +1350,14 @@ GORSE_API_KEY = os.getenv('GORSE_API_KEY', '')
 gorse_client = GorseClient(GORSE_API_URL, GORSE_API_KEY)
 
 # ---------------------------
-# Category Mapper for Master Categories
+# Master Categories - Used for post classification
 # ---------------------------
+# Posts are automatically classified into master categories using OpenAI in generate_categories()
+# No need for CategoryMapper anymore - OpenAI directly outputs master category IDs
 
 print("\n" + "="*70)
-print("Initializing Category Mapper for Master Category Mapping...")
-print("="*70)
-
-from category_mapper import CategoryMapper
-
-# Initialize CategoryMapper once at startup (model loading is expensive)
-# similarity_threshold=0.35: Only assign categories with similarity >= 0.35
-# min_categories=1: At least 1 category per post
-# max_categories=4: At most 4 categories per post (top 4 by similarity)
-try:
-    category_mapper = CategoryMapper(
-        similarity_threshold=0.35,
-        min_categories=1,
-        max_categories=4
-    )
-    print("✓ Category Mapper initialized successfully")
-    CATEGORY_MAPPER_ENABLED = True
-except Exception as e:
-    print(f"⚠ Warning: Failed to initialize Category Mapper: {e}")
-    print("  Raw labels will be used without mapping")
-    category_mapper = None
-    CATEGORY_MAPPER_ENABLED = False
-
+print("Master Categories System Ready")
+print("Post labeling uses OpenAI to directly generate master category labels")
 print("="*70 + "\n")
 
 # Load topic-to-category mapping from Firestore for user interests
@@ -3752,39 +4009,71 @@ def get_inventory():
 # Feed Controller
 # ---------------------------
 def generate_categories(post_text):
+    """
+    Generate master categories for a post using OpenAI.
+    Returns a list of master category IDs (e.g., ["mental_health_wellness", "gaming_virtual_worlds"])
+    """
     try:
         if not post_text:
             return []
         
+        # Build a clear list of master categories for the prompt
+        from master_categories import MASTER_CATEGORIES, CATEGORY_DISPLAY_NAMES
+        
+        categories_list = "\n".join([
+            f"- {cat_id}: {CATEGORY_DISPLAY_NAMES[cat_id]}" 
+            for cat_id in MASTER_CATEGORIES
+        ])
+        
         prompt = (
-            f"Classify the following post into relevant categories and return a JSON array. "
-            f"Do not add anything else—just give me a JSON array starting and ending with brackets. "
-            f"Post: {post_text}"
+            f"Classify the following post into 1-4 of these master categories.\n\n"
+            f"MASTER CATEGORIES:\n{categories_list}\n\n"
+            f"Return ONLY a JSON array of category IDs (the lowercase_underscore version). "
+            f"Example: [\"mental_health_wellness\", \"gaming_virtual_worlds\"]\n\n"
+            f"Post: {post_text}\n\n"
+            f"Categories (JSON array only):"
         )
         
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",  # Using mini for faster/cheaper classification
             messages=[
-                {"role": "system", "content": "You are a text classification model."},
+                {"role": "system", "content": "You are a precise content classifier. Return only valid JSON arrays of category IDs."},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            temperature=0.3  # Lower temperature for more consistent classification
         )
         
         content = response.choices[0].message.content.strip()
 
-        # Ensure we only get valid JSON output
+        # Extract JSON array from response
         try:
+            # Remove markdown code blocks if present
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            
             categories = json.loads(content)
+            
             if isinstance(categories, list):
-                return categories[:5]
+                # Validate that returned categories are in MASTER_CATEGORIES
+                valid_categories = [cat for cat in categories if cat in MASTER_CATEGORIES]
+                
+                if not valid_categories:
+                    print(f"⚠ No valid master categories returned for post, using fallback")
+                    return ["entertainment_memes"]  # Safe fallback
+                
+                # Limit to 4 categories
+                return valid_categories[:4]
         except json.JSONDecodeError:
-            print(f"Invalid JSON response: {content}")
+            print(f"❌ Invalid JSON response from OpenAI: {content}")
+            return ["entertainment_memes"]  # Safe fallback
         
         return []
     
     except Exception as ex:
-        print(f"Error generating categories: {ex}")
-        return []
+        print(f"❌ Error generating categories: {ex}")
+        return ["entertainment_memes"]  # Safe fallback
 
 @app.route('/feed/create-human-post', methods=['POST'])
 def create_human_post():
@@ -3823,28 +4112,15 @@ def create_human_post():
             "user_name": username,
             "id": data.get("Id"),
             "is_influencer": is_influencer,
-            "character_info": data.get("character_info")
+            "character_info": data.get("character_info"),
+            "masterCategories": categories  # Categories are already master categories from generate_categories()
         }
-
-        # Map categories to master categories using CategoryMapper
-        master_categories = categories  # Default: use raw categories
-        if CATEGORY_MAPPER_ENABLED and category_mapper and categories:
-            try:
-                master_categories = category_mapper.map_labels_to_categories(categories)
-                print(f"   Post categories: {categories} → master: {master_categories}")
-            except Exception as e:
-                print(f"⚠ Warning: Failed to map categories, using raw: {e}")
-                master_categories = categories
-
-        # Store both raw and mapped categories in post_data
-        post_data["masterCategories"] = master_categories
 
         db.collection('humanPosts').document(data.get("Id")).set(post_data)
 
-        # Update Gorse with new post using MAPPED categories
+        # Update Gorse with new post using master categories
         try:
-            # Use master categories for Gorse labels
-            labels = master_categories.copy() if master_categories else []
+            labels = categories.copy() if categories else []
             if image_content:
                 labels.append('has_image')
             if video_content:
@@ -3857,7 +4133,7 @@ def create_human_post():
                 comment=post_text[:200] if post_text else '',
                 timestamp=datetime.now(timezone.utc).isoformat()
             )
-            print(f"✓ Synced post {data.get('Id')} to Gorse with {len(master_categories)} master category labels")
+            print(f"✓ Synced post {data.get('Id')} to Gorse with {len(categories)} master category labels")
         except Exception as e:
             print(f"⚠ Failed to sync post to Gorse: {e}")
 
@@ -3900,20 +4176,8 @@ def create_ai_post():
                 "video_content": video_content
             },
             "user_name": username,
+            "masterCategories": categories  # Categories are already master categories from generate_categories()
         }
-
-        # Map categories to master categories using CategoryMapper
-        master_categories = categories  # Default: use raw categories
-        if CATEGORY_MAPPER_ENABLED and category_mapper and categories:
-            try:
-                master_categories = category_mapper.map_labels_to_categories(categories)
-                print(f"   AI post categories: {categories} → master: {master_categories}")
-            except Exception as e:
-                print(f"⚠ Warning: Failed to map categories, using raw: {e}")
-                master_categories = categories
-
-        # Store both raw and mapped categories in post_data
-        post_data["masterCategories"] = master_categories
 
         doc_ref = db.collection('aiPosts').document()
         post_id = doc_ref.id
@@ -3922,10 +4186,9 @@ def create_ai_post():
 
         ai_user_ref.update({"posts": firestore.ArrayUnion([post_id])})
 
-        # Update Gorse with new AI post using MAPPED categories
+        # Update Gorse with new AI post using master categories
         try:
-            # Use master categories for Gorse labels
-            labels = master_categories.copy() if master_categories else []
+            labels = categories.copy() if categories else []
             if image_content:
                 labels.append('has_image')
             if video_content:
@@ -3938,7 +4201,7 @@ def create_ai_post():
                 comment=post_text[:200] if post_text else '',
                 timestamp=datetime.now(timezone.utc).isoformat()
             )
-            print(f"✓ Synced AI post {post_id} to Gorse with {len(master_categories)} master category labels")
+            print(f"✓ Synced AI post {post_id} to Gorse with {len(categories)} master category labels")
         except Exception as e:
             print(f"⚠ Failed to sync AI post to Gorse: {e}")
 
@@ -4079,22 +4342,12 @@ def create_repost():
         video_content = data.get("Post").get("VideoContent", [])
         categories = data.get("category", []) if data.get("category", []) else generate_categories(post_text)
 
-        # Map categories to master categories using CategoryMapper
-        master_categories = categories  # Default: use raw categories
-        if CATEGORY_MAPPER_ENABLED and category_mapper and categories:
-            try:
-                master_categories = category_mapper.map_labels_to_categories(categories)
-                print(f"   Repost categories: {categories} → master: {master_categories}")
-            except Exception as e:
-                print(f"⚠ Warning: Failed to map categories, using raw: {e}")
-                master_categories = categories
-
         post_data = {
             "ai_chat_content": data.get("AIChatContent"),
             "ai_name": data.get("AIName"),
             "ai_profile_image_url": data.get("AIProfileImageURL"),
             "category": categories,
-            "masterCategories": master_categories,
+            "masterCategories": categories,  # Categories are already master categories from generate_categories()
             "comments": [],
             "date_posted": firestore.SERVER_TIMESTAMP,
             "likes": 0,
@@ -4108,14 +4361,15 @@ def create_repost():
             "user_document_id": data.get("UserDocumentId"),
             "user_name": data.get("UserName"),
             "ai_id": data.get("AiId"),
-            "id": data.get("Id")
+            "id": data.get("Id"),
+            "masterCategories": categories  # Categories are already master categories from generate_categories()
         }
 
         db.collection('reposts').document(data.get("Id")).set(post_data)
 
-        # Sync repost to Gorse with MAPPED categories
+        # Sync repost to Gorse with master categories
         try:
-            labels = master_categories.copy() if master_categories else []
+            labels = categories.copy() if categories else []
             if image_content:
                 labels.append('has_image')
             if video_content:
@@ -4128,7 +4382,7 @@ def create_repost():
                 comment=post_text[:200] if post_text else '',
                 timestamp=datetime.now(timezone.utc).isoformat()
             )
-            print(f"✓ Synced repost {data.get('Id')} to Gorse with {len(master_categories)} master category labels")
+            print(f"✓ Synced repost {data.get('Id')} to Gorse with {len(categories)} master category labels")
         except Exception as e:
             print(f"⚠ Failed to sync repost to Gorse: {e}")
 
@@ -4241,9 +4495,17 @@ def get_smart_recommendations():
         limit = data.get('limit', 20)
         target_match_rate = data.get('target_match_rate', 0.7)
         include_verification = data.get('include_verification', False)
+        batch_number = data.get('batch_number', 0)  # Batch number for different recommendation sets
+        page = data.get('page', 1)  # NEW: Page number for pagination within same batch
+        exclude_ids = data.get('exclude_ids', [])  # Post IDs already loaded in client
 
         if not user_id:
             return jsonify({"success": False, "error": "user_id is required"}), 400
+
+        if exclude_ids:
+            print(f"[SmartRecs] 🔄 Batch #{batch_number}, Page {page} requested by user {user_id[:15]}... (excluding {len(exclude_ids)} already-loaded posts)")
+        else:
+            print(f"[SmartRecs] 🔄 Batch #{batch_number}, Page {page} requested by user {user_id[:15]}...")
 
         # Get user's interest labels from Firestore
         user_doc = db.collection('humanUsers').document(user_id).get()
@@ -4279,20 +4541,25 @@ def get_smart_recommendations():
         # To disable ranking, pass use_ranking=false in request
         use_ranking = data.get('use_ranking', True)
 
-        # PAGINATION FIX: Cap at 30 posts to avoid timeout
-        # Even if Flutter requests 100, we only return 30 (fast response)
-        MAX_POOL_SIZE = 30  # Cap to prevent timeout
-        total_pool_size = min(limit, MAX_POOL_SIZE)  # Use smaller of requested or max
+        # PAGINATION SETUP: Generate larger pool, then slice by page
+        # Each batch generates 30 posts (3 pages x 10 posts per page)
+        # Same batch_number = same 30 posts, different pages = different slices
+        POSTS_PER_PAGE = 10  # Each page returns 10 posts
+        MAX_POOL_SIZE = 30   # Generate 30 posts per batch (supports 3 pages)
+        total_pool_size = MAX_POOL_SIZE  # Always generate full pool for consistent pagination
 
         if use_ranking:
             # Get smart recommendations WITH recency and popularity ranking
+            # Use global config for real-time adjustable parameters
             recommendations = gorse_client.get_smart_recommendations_with_ranking(
                 user_id=user_id,
                 user_labels=user_labels,
                 n=total_pool_size,  # Get large pool for pagination
                 target_match_rate=target_match_rate,
-                recency_weight=0.3,
-                popularity_weight=0.35
+                recency_weight=feed_config.recency_weight,
+                popularity_weight=feed_config.popularity_weight,
+                batch_number=batch_number,  # NEW: Pass batch number for variation
+                exclude_ids=exclude_ids  # Exclude posts already loaded in client
             )
             method = "smart_category_ranked"
         else:
@@ -4317,8 +4584,22 @@ def get_smart_recommendations():
                 "data": {"user_labels": user_labels, "total": 0}
             }), 200
 
+        # PAGINATION: Slice the recommendation pool by page number
+        # Page 1 = items 0-9, Page 2 = items 10-19, Page 3 = items 20-29
+        start_idx = (page - 1) * POSTS_PER_PAGE
+        end_idx = start_idx + POSTS_PER_PAGE
+        paged_recommendations = recommendations[start_idx:end_idx]
+        
+        # Show first 3 IDs for debugging
+        if paged_recommendations:
+            first_3_ids = [pid[:15] + '...' for pid in paged_recommendations[:3]]
+            print(f"[SmartRecs] 📄 Batch {batch_number}, Page {page}: Returning posts [{start_idx}:{end_idx}] = {len(paged_recommendations)} posts")
+            print(f"[SmartRecs] 📋 First 3 IDs: {first_3_ids}")
+        else:
+            print(f"[SmartRecs] 📄 Batch {batch_number}, Page {page}: EMPTY (no posts in range [{start_idx}:{end_idx}])")
+
         # Convert post IDs to full post objects for Flutter app
-        all_post_objects = get_posts_by_ids(recommendations)
+        all_post_objects = get_posts_by_ids(paged_recommendations)
 
         # Filter out None values (posts that don't exist in Firestore)
         post_objects = [p for p in all_post_objects if p is not None]
@@ -4334,12 +4615,15 @@ def get_smart_recommendations():
             "success": True,
             "recommendations": post_objects,  # Flutter expects this key with full post objects
             "data": {
-                "post_ids": recommendations,  # Keep IDs for reference
+                "post_ids": paged_recommendations,  # IDs for this specific page
                 "user_labels": user_labels,
                 "total": len(post_objects),
                 "target_match_rate": target_match_rate,
                 "method": method,
-                "ranking_enabled": use_ranking
+                "ranking_enabled": use_ranking,
+                "page": page,  # Current page number
+                "batch_number": batch_number,  # Current batch number
+                "pool_size": len(recommendations)  # Total pool size for this batch
             }
         }
 
@@ -6951,6 +7235,101 @@ def create_group():
     data = request.json
     db.collection('groups').document(data['id']).set(data)
     return jsonify({'message': 'Group created successfully'})
+
+# --------------------------
+# Feed Recommendation Configuration API
+# --------------------------
+
+@app.route('/admin/feed-config', methods=['GET'])
+def get_feed_config():
+    """
+    Get current feed recommendation configuration.
+    Returns all scoring weights, boosts, and diversity settings.
+    """
+    return jsonify({
+        'success': True,
+        'config': feed_config.to_dict()
+    }), 200
+
+@app.route('/admin/feed-config', methods=['POST'])
+def update_feed_config():
+    """
+    Update feed recommendation configuration in real-time.
+
+    Example request body:
+    {
+        "weights": {
+            "recency": 0.3,
+            "popularity": 0.35,
+            "category": 0.35
+        },
+        "boosts": {
+            "video": 0.0,
+            "image": 0.0,
+            "text": 0.15,
+            "human": 0.2,
+            "influencer": 0.3
+        },
+        "diversity": {
+            "enabled": true,
+            "strength": 1.0
+        }
+    }
+    """
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'No configuration data provided'
+            }), 400
+
+        # Update configuration
+        feed_config.update_from_dict(data)
+
+        print(f"[FeedConfig] 🔧 Configuration updated:")
+        print(f"  Weights: R={feed_config.recency_weight:.2f}, P={feed_config.popularity_weight:.2f}, C={feed_config.category_weight:.2f}")
+        print(f"  Media Boosts: Video={feed_config.video_boost:.2f}, Image={feed_config.image_boost:.2f}, Text={feed_config.text_boost:.2f}")
+        print(f"  User Boosts: Human={feed_config.human_boost:.2f}, Influencer={feed_config.influencer_boost:.2f}")
+        print(f"  Diversity: Enabled={feed_config.enable_media_diversity}, Strength={feed_config.diversity_strength:.2f}")
+
+        return jsonify({
+            'success': True,
+            'message': 'Configuration updated successfully',
+            'config': feed_config.to_dict()
+        }), 200
+
+    except Exception as e:
+        print(f"[FeedConfig] ❌ Error updating configuration: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/admin/feed-config/reset', methods=['POST'])
+def reset_feed_config():
+    """
+    Reset feed recommendation configuration to defaults.
+    """
+    try:
+        global feed_config
+        feed_config = FeedRecommendationConfig()
+
+        print(f"[FeedConfig] 🔄 Configuration reset to defaults")
+
+        return jsonify({
+            'success': True,
+            'message': 'Configuration reset to defaults',
+            'config': feed_config.to_dict()
+        }), 200
+
+    except Exception as e:
+        print(f"[FeedConfig] ❌ Error resetting configuration: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 # --------------------------
 # AI Engagement System
