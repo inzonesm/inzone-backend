@@ -18,7 +18,6 @@ GOOGLE_APPLICATION_CREDENTIALS: 'your_path_here'
 # Application Settings
 PACKAGE_NAME: 'your_package_name'
 
-# Optional: Additional cloud-specific settings
-# DEBUG: 'false'
-# LOG_LEVEL: 'info'
-# ENVIRONMENT: 'production'
+GORSE_API_URL: 'gorse_url'
+GORSE_API_KEY: 'gorse_api_key'
+GORSE_LABEL_RATIO: 0.7

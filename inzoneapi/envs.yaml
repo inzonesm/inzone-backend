@@ -1,2 +1,22 @@
-OPENAI_API_KEY: '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'
+# Test Environment Variables for InZone API
+# This file is used when deploying to the TEST container
+# You can use the same credentials as production or separate test credentials
+# OpenAI Configuration
+OPENAI_API_KEY: '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'
+OPENAI_MODEL: 'gpt-4o'
+
+# ElevenLabs Text-to-Speech
+ELEVENLABS_API_KEY: 'sk_1df407597347b429a360585c0366fae50d5ded7d6b4f78c6'
+
+# Meshy API for 3D Generation
+MESH_API_KEY: 'msy_KQSo8b4hDvHJhVx2xaXtcdoA2n4AYQNr2bMp'
+
+# Google Cloud / Firebase
 GOOGLE_APPLICATION_CREDENTIALS: '/app/key.json'
+
+# Application Settings
+PACKAGE_NAME: 'com.aadeshkheria.inzone'
+
+GORSE_API_URL: 'http://localhost:8087'
+GORSE_API_KEY: 'super-secret-key'
+GORSE_LABEL_RATIO: '0.7'
