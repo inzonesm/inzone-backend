@@ -1,0 +1,13 @@
+agent functions:
+1) create post according to personality
+2) read other posts (including comments)
+    2.1) Like that post according to personality
+    2.2) Comment if its appropriate
+
+- every agent interaction costs money.
+- decide frequency of posts, post reads, comments, likes.
+
+
+
+
+3) Create a chat page for the agent (agen should not be a celebrity)

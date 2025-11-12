@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Feed Recommendation Config Panel</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+
+        .section h2 {
+            color: #555;
+            margin-bottom: 15px;
+            font-size: 18px;
+            display: flex;
+            align-items: center;
+        }
+
+        .section h2::before {
+            content: "";
+            width: 4px;
+            height: 20px;
+            background: #667eea;
+            margin-right: 10px;
+            border-radius: 2px;
+        }
+
+        .control-group {
+            margin-bottom: 20px;
+        }
+
+        .control-group:last-child {
+            margin-bottom: 0;
+        }
+
+        label {
+            display: block;
+            color: #555;
+            font-weight: 600;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        .slider-container {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        input[type="range"] {
+            flex: 1;
+            height: 6px;
+            background: #ddd;
+            border-radius: 3px;
+            outline: none;
+            -webkit-appearance: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            background: #667eea;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+            background: #5568d3;
+        }
+
+        input[type="range"]::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            background: #667eea;
+            border-radius: 50%;
+            cursor: pointer;
+            border: none;
+        }
+
+        .value-display {
+            min-width: 60px;
+            text-align: right;
+            font-weight: 700;
+            color: #667eea;
+            font-size: 16px;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 15px;
+            margin-top: 30px;
+        }
+
+        button {
+            flex: 1;
+            padding: 14px 28px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+            transform: translateY(-2px);
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+            transform: translateY(-2px);
+        }
+
+        .status {
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            font-weight: 600;
+            text-align: center;
+            display: none;
+        }
+
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .checkbox-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .api-url-input {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            margin-bottom: 15px;
+        }
+
+        .api-url-input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .info-box {
+            background: #e3f2fd;
+            border-left: 4px solid #2196f3;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 13px;
+            color: #0d47a1;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎛️ Feed Recommendation Config Panel</h1>
+        <p class="subtitle">Real-time configuration for InZone feed algorithm</p>
+
+        <div class="info-box">
+            <strong>💡 Tip:</strong> Set video/image boost to 0.0 to prevent content clustering. Increase text boost to promote text-only posts.
+        </div>
+
+        <div class="control-group">
+            <label>Backend API URL:</label>
+            <input type="text" id="apiUrl" class="api-url-input"
+                   value="https://inzoneapi-912424781531.us-central1.run.app"
+                   placeholder="https://your-backend-url.com">
+        </div>
+
+        <div class="section">
+            <h2>Scoring Weights</h2>
+            <p style="color: #777; font-size: 13px; margin-bottom: 15px;">These should sum to approximately 1.0</p>
+
+            <div class="control-group">
+                <label>Recency Weight (freshness)</label>
+                <div class="slider-container">
+                    <input type="range" id="recency" min="0" max="1" step="0.05" value="0.3">
+                    <span class="value-display" id="recency-val">0.30</span>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>Popularity Weight (engagement)</label>
+                <div class="slider-container">
+                    <input type="range" id="popularity" min="0" max="1" step="0.05" value="0.35">
+                    <span class="value-display" id="popularity-val">0.35</span>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>Category Weight (interest matching)</label>
+                <div class="slider-container">
+                    <input type="range" id="category" min="0" max="1" step="0.05" value="0.35">
+                    <span class="value-display" id="category-val">0.35</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Media Type Boosts</h2>
+            <p style="color: #777; font-size: 13px; margin-bottom: 15px;">Set to 0.0 to disable and prevent clustering</p>
+
+            <div class="control-group">
+                <label>Video Boost</label>
+                <div class="slider-container">
+                    <input type="range" id="video" min="0" max="0.5" step="0.05" value="0">
+                    <span class="value-display" id="video-val">0.00</span>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>Image Boost</label>
+                <div class="slider-container">
+                    <input type="range" id="image" min="0" max="0.5" step="0.05" value="0">
+                    <span class="value-display" id="image-val">0.00</span>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>Text Post Boost</label>
+                <div class="slider-container">
+                    <input type="range" id="text" min="0" max="0.5" step="0.05" value="0">
+                    <span class="value-display" id="text-val">0.00</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>User Type Boosts</h2>
+
+            <div class="control-group">
+                <label>Human Post Boost</label>
+                <div class="slider-container">
+                    <input type="range" id="human" min="0" max="0.5" step="0.05" value="0.2">
+                    <span class="value-display" id="human-val">0.20</span>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>Influencer Boost</label>
+                <div class="slider-container">
+                    <input type="range" id="influencer" min="0" max="0.5" step="0.05" value="0.3">
+                    <span class="value-display" id="influencer-val">0.30</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Diversity Settings</h2>
+
+            <div class="control-group">
+                <label class="checkbox-container">
+                    <input type="checkbox" id="diversity-enabled" checked>
+                    <span>Enable Media Type Diversity Mixing</span>
+                </label>
+            </div>
+
+            <div class="control-group">
+                <label>Diversity Strength</label>
+                <div class="slider-container">
+                    <input type="range" id="diversity-strength" min="0" max="2" step="0.1" value="1">
+                    <span class="value-display" id="diversity-strength-val">1.0</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="button-group">
+            <button class="btn-primary" onclick="applyConfig()">Apply Configuration</button>
+            <button class="btn-secondary" onclick="loadConfig()">Reload Current</button>
+            <button class="btn-danger" onclick="resetConfig()">Reset to Defaults</button>
+        </div>
+
+        <div id="status" class="status"></div>
+    </div>
+
+    <script>
+        // Update value displays
+        const sliders = [
+            'recency', 'popularity', 'category',
+            'video', 'image', 'text',
+            'human', 'influencer', 'diversity-strength'
+        ];
+
+        sliders.forEach(id => {
+            const slider = document.getElementById(id);
+            const display = document.getElementById(id + '-val');
+
+            slider.addEventListener('input', () => {
+                display.textContent = parseFloat(slider.value).toFixed(2);
+            });
+        });
+
+        function showStatus(message, isError = false) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = 'status ' + (isError ? 'error' : 'success');
+            status.style.display = 'block';
+
+            setTimeout(() => {
+                status.style.display = 'none';
+            }, 5000);
+        }
+
+        function getApiUrl() {
+            return document.getElementById('apiUrl').value.trim();
+        }
+
+        async function loadConfig() {
+            try {
+                const response = await fetch(getApiUrl() + '/admin/feed-config');
+                const data = await response.json();
+
+                if (data.success) {
+                    const config = data.config;
+
+                    // Update weights
+                    document.getElementById('recency').value = config.weights.recency;
+                    document.getElementById('recency-val').textContent = config.weights.recency.toFixed(2);
+
+                    document.getElementById('popularity').value = config.weights.popularity;
+                    document.getElementById('popularity-val').textContent = config.weights.popularity.toFixed(2);
+
+                    document.getElementById('category').value = config.weights.category;
+                    document.getElementById('category-val').textContent = config.weights.category.toFixed(2);
+
+                    // Update boosts
+                    document.getElementById('video').value = config.boosts.video;
+                    document.getElementById('video-val').textContent = config.boosts.video.toFixed(2);
+
+                    document.getElementById('image').value = config.boosts.image;
+                    document.getElementById('image-val').textContent = config.boosts.image.toFixed(2);
+
+                    document.getElementById('text').value = config.boosts.text;
+                    document.getElementById('text-val').textContent = config.boosts.text.toFixed(2);
+
+                    document.getElementById('human').value = config.boosts.human;
+                    document.getElementById('human-val').textContent = config.boosts.human.toFixed(2);
+
+                    document.getElementById('influencer').value = config.boosts.influencer;
+                    document.getElementById('influencer-val').textContent = config.boosts.influencer.toFixed(2);
+
+                    // Update diversity
+                    document.getElementById('diversity-enabled').checked = config.diversity.enabled;
+                    document.getElementById('diversity-strength').value = config.diversity.strength;
+                    document.getElementById('diversity-strength-val').textContent = config.diversity.strength.toFixed(1);
+
+                    showStatus('✅ Configuration loaded successfully');
+                } else {
+                    showStatus('❌ Failed to load configuration', true);
+                }
+            } catch (error) {
+                showStatus('❌ Error: ' + error.message, true);
+            }
+        }
+
+        async function applyConfig() {
+            const config = {
+                weights: {
+                    recency: parseFloat(document.getElementById('recency').value),
+                    popularity: parseFloat(document.getElementById('popularity').value),
+                    category: parseFloat(document.getElementById('category').value)
+                },
+                boosts: {
+                    video: parseFloat(document.getElementById('video').value),
+                    image: parseFloat(document.getElementById('image').value),
+                    text: parseFloat(document.getElementById('text').value),
+                    human: parseFloat(document.getElementById('human').value),
+                    influencer: parseFloat(document.getElementById('influencer').value)
+                },
+                diversity: {
+                    enabled: document.getElementById('diversity-enabled').checked,
+                    strength: parseFloat(document.getElementById('diversity-strength').value)
+                }
+            };
+
+            try {
+                const response = await fetch(getApiUrl() + '/admin/feed-config', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(config)
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showStatus('✅ Configuration applied successfully!');
+                } else {
+                    showStatus('❌ Failed to apply configuration', true);
+                }
+            } catch (error) {
+                showStatus('❌ Error: ' + error.message, true);
+            }
+        }
+
+        async function resetConfig() {
+            if (!confirm('Reset all settings to defaults?')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(getApiUrl() + '/admin/feed-config/reset', {
+                    method: 'POST'
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    await loadConfig();
+                    showStatus('✅ Configuration reset to defaults');
+                } else {
+                    showStatus('❌ Failed to reset configuration', true);
+                }
+            } catch (error) {
+                showStatus('❌ Error: ' + error.message, true);
+            }
+        }
+
+        // Load current config on page load
+        window.addEventListener('load', loadConfig);
+    </script>
+</body>
+</html>
