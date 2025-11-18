@@ -92,6 +92,10 @@ class FeedService:
     def create_human_post(data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a human post"""
         try:
+            logger.info("=" * 70)
+            logger.info("[CREATE_HUMAN_POST] New post creation started")
+            logger.info("=" * 70)
+            
             if not data or not data.get("Post"):
                 return jsonify({"success": False, "error": "Post content is required", "code": "INVALID_POST_CONTENT"}), 400
 
@@ -103,6 +107,10 @@ class FeedService:
             image_content = data.get("Post").get("ImageContent", [])
             video_content = data.get("Post").get("VideoContent", [])
             user_document_id = data.get("UserDocumentId")
+
+            logger.info(f"[CREATE_HUMAN_POST] Post text: {post_text[:60]}...")
+            logger.info(f"[CREATE_HUMAN_POST] Images: {len(image_content)}, Videos: {len(video_content)}")
+            logger.info("[CREATE_HUMAN_POST] Calling MultimodalCategoryClassifier...")
 
             # Use multimodal classifier for better categorization
             classification_result = MultimodalCategoryClassifier.classify_post({
@@ -116,14 +124,24 @@ class FeedService:
             subCategories = classification_result.get('subCategories', [])
             masterCategories = classification_result.get('masterCategories', [])
             
+            logger.info(f"[CREATE_HUMAN_POST] Classification result:")
+            logger.info(f"  - subCategories: {subCategories}")
+            logger.info(f"  - masterCategories: {masterCategories}")
+            logger.info(f"  - method: {classification_result.get('method', 'unknown')}")
+            
             # Fallback to old method if classification fails
             if not masterCategories:
                 masterCategories = data.get("category", []) if data.get("category", []) else FeedService.generate_categories(post_text)
-                logger.warning(f"Multimodal classifier returned no categories, using fallback")
+                logger.warning(f"[CREATE_HUMAN_POST] Multimodal classifier returned no categories, using fallback: {masterCategories}")
 
             # Check if user is an influencer
             influencer_doc = db.collection('influencers').document(user_document_id).get()
             is_influencer = influencer_doc.exists
+
+            logger.info(f"[CREATE_HUMAN_POST] Saving post to Firestore...")
+            logger.info(f"  - Post ID: {data.get('Id')}")
+            logger.info(f"  - subCategories: {subCategories}")
+            logger.info(f"  - masterCategories: {masterCategories}")
 
             post_data = {
                 "category": masterCategories,  # Keep for backward compatibility
@@ -147,6 +165,9 @@ class FeedService:
             }
 
             db.collection('humanPosts').document(data.get("Id")).set(post_data)
+            
+            logger.info(f"[CREATE_HUMAN_POST] ✅ Post saved successfully!")
+            logger.info("=" * 70)
 
             # Update Gorse with new post using master categories
             try:
