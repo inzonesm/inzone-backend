@@ -12,6 +12,7 @@ import random
 import hashlib
 from services.recommendation.gorse_client import gorse_client
 from services.content.post_retrieval_service import PostRetrievalService
+from services.content.multimodal_classifier import MultimodalCategoryClassifier
 from utils.helpers import get_user_name
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ class FeedService:
                 return []
 
             # Build a clear list of master categories for the prompt
-            from master_categories import MASTER_CATEGORIES, CATEGORY_DISPLAY_NAMES
+            from utils.master_categories import MASTER_CATEGORIES, CATEGORY_DISPLAY_NAMES
 
             categories_list = "\n".join([
                 f"- {cat_id}: {CATEGORY_DISPLAY_NAMES[cat_id]}"
@@ -73,19 +74,19 @@ class FeedService:
 
                     if not valid_categories:
                         logger.warning("No valid master categories returned for post, using fallback")
-                        return ["entertainment_memes"]  # Safe fallback
+                        return ["entertainment_pop_culture"]  # Safe fallback
 
                     # Limit to 4 categories
                     return valid_categories[:4]
             except json.JSONDecodeError:
                 logger.error(f"Invalid JSON response from OpenAI: {content}")
-                return ["entertainment_memes"]  # Safe fallback
+                return ["entertainment_pop_culture"]  # Safe fallback
 
             return []
 
         except Exception as ex:
             logger.error(f"Error generating categories: {ex}")
-            return ["entertainment_memes"]  # Safe fallback
+            return ["entertainment_pop_culture"]  # Safe fallback
 
     @staticmethod
     def create_human_post(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -101,15 +102,33 @@ class FeedService:
             post_text = data.get("Post").get("TextContent", "")
             image_content = data.get("Post").get("ImageContent", [])
             video_content = data.get("Post").get("VideoContent", [])
-            categories = data.get("category", []) if data.get("category", []) else FeedService.generate_categories(post_text)
             user_document_id = data.get("UserDocumentId")
+
+            # Use multimodal classifier for better categorization
+            classification_result = MultimodalCategoryClassifier.classify_post({
+                'post': {
+                    'text_content': post_text,
+                    'image_content': image_content,
+                    'video_content': video_content
+                }
+            })
+            
+            subCategories = classification_result.get('subCategories', [])
+            masterCategories = classification_result.get('masterCategories', [])
+            
+            # Fallback to old method if classification fails
+            if not masterCategories:
+                masterCategories = data.get("category", []) if data.get("category", []) else FeedService.generate_categories(post_text)
+                logger.warning(f"Multimodal classifier returned no categories, using fallback")
 
             # Check if user is an influencer
             influencer_doc = db.collection('influencers').document(user_document_id).get()
             is_influencer = influencer_doc.exists
 
             post_data = {
-                "category": categories,
+                "category": masterCategories,  # Keep for backward compatibility
+                "subCategories": subCategories,  # New: granular categorization
+                "masterCategories": masterCategories,  # New: master categories
                 "comments": [],
                 "date_posted": firestore.SERVER_TIMESTAMP,
                 "likes": 0,
@@ -124,15 +143,14 @@ class FeedService:
                 "user_name": username,
                 "id": data.get("Id"),
                 "is_influencer": is_influencer,
-                "character_info": data.get("character_info"),
-                "masterCategories": categories  # Categories are already master categories from generate_categories()
+                "character_info": data.get("character_info")
             }
 
             db.collection('humanPosts').document(data.get("Id")).set(post_data)
 
             # Update Gorse with new post using master categories
             try:
-                labels = categories.copy() if categories else []
+                labels = masterCategories.copy() if masterCategories else []
                 if image_content:
                     labels.append('has_image')
                 if video_content:
@@ -145,7 +163,7 @@ class FeedService:
                     comment=post_text[:200] if post_text else '',
                     timestamp=datetime.now(timezone.utc).isoformat()
                 )
-                logger.info(f"Synced post {data.get('Id')} to Gorse with {len(categories)} master category labels")
+                logger.info(f"Synced human post {data.get('Id')} to Gorse with {len(masterCategories)} master categories + {len(subCategories)} subcategories")
             except Exception as e:
                 logger.warning(f"Failed to sync post to Gorse: {e}")
 
@@ -173,10 +191,28 @@ class FeedService:
             post_text = data.get("Post").get("TextContent", "")
             image_content = data.get("Post").get("ImageContent", [])
             video_content = data.get("Post").get("VideoContent", [])
-            categories = data.get("category", []) if data.get("category", []) else FeedService.generate_categories(post_text)
+
+            # Use multimodal classifier for better categorization
+            classification_result = MultimodalCategoryClassifier.classify_post({
+                'post': {
+                    'text_content': post_text,
+                    'image_content': image_content,
+                    'video_content': video_content
+                }
+            })
+            
+            subCategories = classification_result.get('subCategories', [])
+            masterCategories = classification_result.get('masterCategories', [])
+            
+            # Fallback to old method if classification fails
+            if not masterCategories:
+                masterCategories = data.get("category", []) if data.get("category", []) else FeedService.generate_categories(post_text)
+                logger.warning(f"Multimodal classifier returned no categories, using fallback")
 
             post_data = {
-                "category": categories,
+                "category": masterCategories,  # Keep for backward compatibility
+                "subCategories": subCategories,  # New: granular categorization
+                "masterCategories": masterCategories,  # New: master categories
                 "comments": [],
                 "date_posted": firestore.SERVER_TIMESTAMP,
                 "likes": 0,
@@ -187,8 +223,7 @@ class FeedService:
                     "text_content": post_text,
                     "video_content": video_content
                 },
-                "user_name": username,
-                "masterCategories": categories  # Categories are already master categories from generate_categories()
+                "user_name": username
             }
 
             doc_ref = db.collection('aiPosts').document()
@@ -200,7 +235,7 @@ class FeedService:
 
             # Update Gorse with new AI post using master categories
             try:
-                labels = categories.copy() if categories else []
+                labels = masterCategories.copy() if masterCategories else []
                 if image_content:
                     labels.append('has_image')
                 if video_content:
@@ -213,7 +248,7 @@ class FeedService:
                     comment=post_text[:200] if post_text else '',
                     timestamp=datetime.now(timezone.utc).isoformat()
                 )
-                logger.info(f"Synced AI post {post_id} to Gorse with {len(categories)} master category labels")
+                logger.info(f"Synced AI post {post_id} to Gorse with {len(masterCategories)} master categories + {len(subCategories)} subcategories")
             except Exception as e:
                 logger.warning(f"Failed to sync AI post to Gorse: {e}")
 
@@ -351,14 +386,31 @@ class FeedService:
             post_text = data.get("Post").get("TextContent", "")
             image_content = data.get("Post").get("ImageContent", [])
             video_content = data.get("Post").get("VideoContent", [])
-            categories = data.get("category", []) if data.get("category", []) else FeedService.generate_categories(post_text)
+
+            # Use multimodal classifier for better categorization
+            classification_result = MultimodalCategoryClassifier.classify_post({
+                'post': {
+                    'text_content': post_text,
+                    'image_content': image_content,
+                    'video_content': video_content
+                }
+            })
+            
+            subCategories = classification_result.get('subCategories', [])
+            masterCategories = classification_result.get('masterCategories', [])
+            
+            # Fallback to old method if classification fails
+            if not masterCategories:
+                masterCategories = data.get("category", []) if data.get("category", []) else FeedService.generate_categories(post_text)
+                logger.warning(f"Multimodal classifier returned no categories, using fallback")
 
             post_data = {
                 "ai_chat_content": data.get("AIChatContent"),
                 "ai_name": data.get("AIName"),
                 "ai_profile_image_url": data.get("AIProfileImageURL"),
-                "category": categories,
-                "masterCategories": categories,  # Categories are already master categories from generate_categories()
+                "category": masterCategories,  # Keep for backward compatibility
+                "subCategories": subCategories,  # New: granular categorization
+                "masterCategories": masterCategories,  # New: master categories
                 "comments": [],
                 "date_posted": firestore.SERVER_TIMESTAMP,
                 "likes": 0,
@@ -372,15 +424,14 @@ class FeedService:
                 "user_document_id": data.get("UserDocumentId"),
                 "user_name": data.get("UserName"),
                 "ai_id": data.get("AiId"),
-                "id": data.get("Id"),
-                "masterCategories": categories  # Categories are already master categories from generate_categories()
+                "id": data.get("Id")
             }
 
             db.collection('reposts').document(data.get("Id")).set(post_data)
 
             # Sync repost to Gorse with master categories
             try:
-                labels = categories.copy() if categories else []
+                labels = masterCategories.copy() if masterCategories else []
                 if image_content:
                     labels.append('has_image')
                 if video_content:
@@ -393,7 +444,7 @@ class FeedService:
                     comment=post_text[:200] if post_text else '',
                     timestamp=datetime.now(timezone.utc).isoformat()
                 )
-                logger.info(f"Synced repost {data.get('Id')} to Gorse with {len(categories)} master category labels")
+                logger.info(f"Synced repost {data.get('Id')} to Gorse with {len(masterCategories)} master categories + {len(subCategories)} subcategories")
             except Exception as e:
                 logger.warning(f"Failed to sync repost to Gorse: {e}")
 

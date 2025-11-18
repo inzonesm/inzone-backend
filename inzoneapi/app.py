@@ -92,9 +92,29 @@ app.register_blueprint(api_users_bp)
 app.register_blueprint(api_profiles_bp)
 app.register_blueprint(scheduler_notif_bp)
 
-# Global error handler
+# Favicon route to prevent 404 errors
+@app.route('/favicon.ico')
+def favicon():
+    """Return empty response for favicon to prevent 404 errors"""
+    from flask import make_response
+    response = make_response('', 204)  # 204 No Content
+    response.headers['Content-Type'] = 'image/x-icon'
+    return response
+
+# 404 error handler (specific routes not found)
+@app.errorhandler(404)
+def handle_404(e):
+    """Handle 404 errors gracefully without logging as unhandled exceptions"""
+    return jsonify({"success": False, "error": "Endpoint not found"}), 404
+
+# Global error handler for other exceptions
 @app.errorhandler(Exception)
 def handle_exception(e):
+    # Don't log 404 as unhandled exceptions
+    from werkzeug.exceptions import NotFound
+    if isinstance(e, NotFound):
+        return jsonify({"success": False, "error": "Not found"}), 404
+    
     logger.exception("[unhandled] %s", e)
     return jsonify({"success": False, "error": "Internal error"}), 500
 

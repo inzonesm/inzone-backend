@@ -59,6 +59,7 @@ gopath/
 .env.*
 *.env
 !.env.example
+envs.yaml
 key.json
 *key.json
 openai_key.txt

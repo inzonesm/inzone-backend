@@ -1,10 +1,11 @@
 from typing import List
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from config import Config
 from config.feed_config import feed_config
 from dependencies import db
 from firebase_admin import firestore
+import hashlib
 
 class GorseClient:
     """Client for Gorse Recommendation System"""
@@ -87,8 +88,13 @@ class GorseClient:
                 'isoTimestamp': iso_timestamp
             }
 
-            # Store in Firestore: userFeedback/{userId}/interactions/{auto_id}
-            db.collection('userFeedback').document(user_id).collection('interactions').add(feedback_doc)
+            # Use deterministic document ID to prevent duplicates
+            # Format: {userId}_{postId}_{feedbackType}
+            doc_id = hashlib.md5(f"{user_id}_{post_id}_{feedback_type}".encode()).hexdigest()
+
+            # Store in Firestore using set() instead of add() to handle duplicates gracefully
+            # This will update the timestamp if user re-views the same post
+            db.collection('userFeedback').document(user_id).collection('interactions').document(doc_id).set(feedback_doc, merge=True)
 
             # Also update user's interaction summary for quick analytics
             summary_ref = db.collection('userFeedback').document(user_id)
