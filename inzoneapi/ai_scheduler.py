@@ -877,13 +877,13 @@ class AIScheduler:
                             success = self.execute_like_interaction(
                                 character_id,
                                 interaction['target_post_id'],
-                                interaction.get('post_collection', 'humanPosts')
+                                interaction.get('post_collection')
                             )
                         elif interaction_type == 'comment':
                             success = self.execute_comment_interaction(
                                 character_id,
                                 interaction['target_post_id'],
-                                interaction.get('post_collection', 'humanPosts')
+                                interaction.get('post_collection')
                             )
                         elif interaction_type == 'dm':
                             success = self.execute_dm_interaction(
@@ -934,8 +934,8 @@ class AIScheduler:
             logger.error(f"Error executing all scheduled interactions: {e}")
             return {'success': False, 'error': str(e)}
 
-    def execute_like_interaction(self, character_id: str, post_id: str, collection: str = 'humanPosts') -> bool:
-        """Execute a like interaction using proper database structure"""
+    def execute_like_interaction(self, character_id: str, post_id: str, collection: str = None) -> bool:
+        """Execute a like interaction using proper database structure. Searches both humanPosts and aiPosts."""
         try:
             # Check if already liked
             existing_like_query = self.db.collection('postLikes')\
@@ -948,19 +948,38 @@ class AIScheduler:
                 logger.info(f"Character {character_id} already liked post {post_id}")
                 return False
             
-            # Get post data to find the post author for notification
-            post_ref = self.db.collection(collection).document(post_id)
-            post_doc = post_ref.get()
+            # Get post data - try specified collection first, then search both collections
+            post_doc = None
+            actual_collection = collection
             
-            if not post_doc.exists:
-                logger.error(f"Post {post_id} not found")
+            if collection:
+                post_ref = self.db.collection(collection).document(post_id)
+                post_doc = post_ref.get()
+                if post_doc.exists:
+                    actual_collection = collection
+            
+            # If not found or no collection specified, search both collections
+            if not post_doc or not post_doc.exists:
+                for coll in ['humanPosts', 'aiPosts']:
+                    post_ref = self.db.collection(coll).document(post_id)
+                    post_doc = post_ref.get()
+                    if post_doc.exists:
+                        actual_collection = coll
+                        break
+            
+            if not post_doc or not post_doc.exists:
+                logger.error(f"Post {post_id} not found in humanPosts or aiPosts")
                 return False
             
             post_data = post_doc.to_dict()
-            post_author_id = post_data.get('user_document_id') or post_data.get('user_id')
+            # humanPosts use 'user_document_id', aiPosts use 'user_name' as author
+            if actual_collection == 'aiPosts':
+                post_author_id = post_data.get('user_name')
+            else:
+                post_author_id = post_data.get('user_document_id')
             
             if not post_author_id:
-                logger.error(f"Could not find post author for post {post_id}")
+                logger.error(f"Could not find post author for post {post_id} in collection {actual_collection}. Post data keys: {list(post_data.keys())}")
                 return False
             
             # Get character data for notification
@@ -1038,7 +1057,7 @@ class AIScheduler:
             # Log the interaction
             self.log_interaction(character_id, post_id, EngagementType.LIKE, {
                 'post_id': post_id,
-                'collection': collection,
+                'collection': actual_collection,
                 'post_author_id': post_author_id
             })
             
@@ -1049,8 +1068,8 @@ class AIScheduler:
             logger.error(f"Error executing like interaction: {e}")
             return False
     
-    def execute_comment_interaction(self, character_id: str, post_id: str, collection: str = 'humanPosts') -> bool:
-        """Execute a comment interaction using the proper InZoneAIEngagementService"""
+    def execute_comment_interaction(self, character_id: str, post_id: str, collection: str = None) -> bool:
+        """Execute a comment interaction using the proper InZoneAIEngagementService. Searches both humanPosts and aiPosts."""
         try:
             # Import the proper AI service
             from inzone_ai_engagement import InZoneAIEngagementService
@@ -1075,12 +1094,27 @@ class AIScheduler:
             char_data['_is_popular_character'] = True
             char_data['_collection_source'] = 'popularCharacters'
             
-            # Get post data
-            post_ref = self.db.collection(collection).document(post_id)
-            post_doc = post_ref.get()
+            # Get post data - try specified collection first, then search both collections
+            post_doc = None
+            actual_collection = collection
             
-            if not post_doc.exists:
-                logger.error(f"Post {post_id} not found")
+            if collection:
+                post_ref = self.db.collection(collection).document(post_id)
+                post_doc = post_ref.get()
+                if post_doc.exists:
+                    actual_collection = collection
+            
+            # If not found or no collection specified, search both collections
+            if not post_doc or not post_doc.exists:
+                for coll in ['humanPosts', 'aiPosts']:
+                    post_ref = self.db.collection(coll).document(post_id)
+                    post_doc = post_ref.get()
+                    if post_doc.exists:
+                        actual_collection = coll
+                        break
+            
+            if not post_doc or not post_doc.exists:
+                logger.error(f"Post {post_id} not found in humanPosts or aiPosts")
                 return False
             
             post_data = post_doc.to_dict()
@@ -1122,12 +1156,16 @@ class AIScheduler:
             self.log_interaction(character_id, post_data.get('user_id', 'unknown'), EngagementType.COMMENT, {
                 'post_id': post_id,
                 'comment': comment_text,
-                'collection': collection
+                'collection': actual_collection
             })
             
             # Create notification for the post author
             try:
-                post_author_id = post_data.get('user_document_id') or post_data.get('user_id')
+                # humanPosts use 'user_document_id', aiPosts use 'user_name' as author
+                if actual_collection == 'aiPosts':
+                    post_author_id = post_data.get('user_name') or post_data.get('user_document_id') or post_data.get('user_id')
+                else:
+                    post_author_id = post_data.get('user_document_id') or post_data.get('user_id') or post_data.get('user_name')
                 
                 if post_author_id and post_author_id != character_id:
                     # Send post engagement notification using the existing API endpoint
