@@ -2,6 +2,7 @@
 from flask import jsonify
 from google.cloud import firestore
 from dependencies import db
+from services.groups.recommendation_service import GroupChatRecommendationService
 import logging
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,12 @@ class GroupChatService:
             if not all([groupchat_name, creator_id, creator_username, groupchat_doc_id]):
                 return jsonify({"error": "Missing required fields"}), 400
 
+            # Auto-categorize the group chat based on name and bio
+            master_categories = GroupChatRecommendationService.categorize_groupchat(
+                groupchat_name=groupchat_name,
+                bio=bio
+            )
+
             new_groupchat = {
                 'groupchat_name': groupchat_name,
                 'bio': bio,
@@ -119,14 +126,24 @@ class GroupChatService:
                 'ai_usernames': [],
                 'messages': [],
                 'date_created': firestore.SERVER_TIMESTAMP,
-                'groupchat_doc_id': groupchat_doc_id
+                'groupchat_doc_id': groupchat_doc_id,
+                'masterCategories': master_categories  # Add categorization
             }
 
             db.collection('groupChats').document(groupchat_doc_id).set(new_groupchat)
 
+            # Sync with Gorse (placeholder for future integration)
+            GroupChatRecommendationService.sync_groupchat_to_gorse(
+                groupchat_id=groupchat_doc_id,
+                groupchat_data=new_groupchat
+            )
+
+            logger.info(f"Created group chat '{groupchat_name}' with categories: {master_categories}")
+
             return jsonify({
                 "message": "Group chat created successfully",
-                "groupchat_id": groupchat_doc_id
+                "groupchat_id": groupchat_doc_id,
+                "masterCategories": master_categories
             }), 201
 
         except Exception as ex:

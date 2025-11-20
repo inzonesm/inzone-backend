@@ -27,6 +27,7 @@ from routes.ai.characters import ai_characters_bp
 from routes.ai.user_management import ai_user_mgmt_bp
 from routes.groups.management import groups_mgmt_bp
 from routes.groups.access import groups_access_bp
+from routes.groups.recommendations import groups_recommendations_bp
 from routes.notifications.events import notif_events_bp
 from routes.notifications.preferences import notif_prefs_bp
 from routes.notifications.push import notif_push_bp
@@ -76,6 +77,7 @@ app.register_blueprint(ai_characters_bp)
 app.register_blueprint(ai_user_mgmt_bp)
 app.register_blueprint(groups_mgmt_bp)
 app.register_blueprint(groups_access_bp)
+app.register_blueprint(groups_recommendations_bp)
 app.register_blueprint(notif_events_bp)
 app.register_blueprint(notif_prefs_bp)
 app.register_blueprint(notif_push_bp)
