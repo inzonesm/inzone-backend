@@ -1,0 +1,30 @@
+# Local Development Environment Variables
+# This file serves as a template for local development
+# Copy values from envs.example.yaml and replace with your local credentials
+# This file is safe to commit (no actual secrets)
+
+# OpenAI Configuration
+OPENAI_API_KEY: 'your_local_openai_api_key_here'
+OPENAI_MODEL: 'gpt-4o'
+
+# ElevenLabs Text-to-Speech
+ELEVENLABS_API_KEY: 'your_local_elevenlabs_api_key_here'
+
+# Meshy API for 3D Generation
+MESH_API_KEY: 'your_local_meshy_api_key_here'
+
+# Google Cloud / Firebase
+# For local development, point to your service account key file
+GOOGLE_APPLICATION_CREDENTIALS: './path/to/your/local/service-account-key.json'
+
+# Application Settings
+PACKAGE_NAME: 'com.yourcompany.inzone.dev'
+
+# Gorse Recommendation Engine
+GORSE_API_URL: 'http://localhost:8087'
+GORSE_API_KEY: 'your_local_gorse_api_key'
+GORSE_LABEL_RATIO: 0.7
+
+# Local Development Flags
+DEBUG: true
+FLASK_ENV: 'development'
