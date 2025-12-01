@@ -611,11 +611,12 @@ class FeedService:
             # DEFAULT CATEGORIES: If user has no interests, use beginner-friendly categories
             # These categories have broad appeal and high engagement
             DEFAULT_COLD_START_CATEGORIES = [
-                "entertainment_memes",      # Universal appeal
-                "learning_education",       # Educational content
-                "creativity_art",           # Visual content
-                "pets_wildlife",           # Animal content (highly engaging)
-                "travel_adventure"         # Aspirational content
+                "comedy_humor_memes",           # Universal appeal
+                "education_learning",           # Educational content
+                "arts_design",                  # Visual content
+                "pets_animals",                 # Animal content (highly engaging)
+                "travel_places",                # Aspirational content
+                "entertainment_pop_culture"     # Trending content
             ]
 
             if not user_labels:
