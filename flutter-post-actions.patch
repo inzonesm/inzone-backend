@@ -1,0 +1,187 @@
+diff --git a/lib/services/api_client.dart b/lib/services/api_client.dart
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/lib/services/api_client.dart
+@@ -0,0 +1,120 @@
++// lib/services/api_client.dart
++import 'dart:convert';
++import 'package:http/http.dart' as http;
++
++class ApiClient {
++  final String baseUrl;
++  final http.Client httpClient;
++
++  ApiClient({required this.baseUrl, http.Client? client})
++      : httpClient = client ?? http.Client();
++
++  Map<String, String> _authHeader([String? idToken]) {
++    final headers = {'Content-Type': 'application/json'};
++    if (idToken != null && idToken.isNotEmpty) {
++      headers['Authorization'] = 'Bearer $idToken';
++    }
++    return headers;
++  }
++
++  /// Fetch a post intended for editing. Returns the JSON body or null on not found.
++  Future<Map<String, dynamic>?> getPostForEdit(String postId, {String? idToken}) async {
++    final uri = Uri.parse('$baseUrl/feed/get-post?post_id=$postId');
++    final res = await httpClient.get(uri, headers: _authHeader(idToken));
++    if (res.statusCode == 200) {
++      final body = json.decode(res.body);
++      return body is Map<String, dynamic> ? body : null;
++    } else {
++      return null;
++    }
++  }
++
++  /// Delete a post. Returns true on success.
++  Future<bool> deletePost(String postId, String userId, {String? idToken}) async {
++    final uri = Uri.parse('$baseUrl/feed/delete-post');
++    final body = json.encode({'PostId': postId, 'UserId': userId});
++    final res = await httpClient.post(uri, headers: _authHeader(idToken), body: body);
++    return res.statusCode == 200;
++  }
++}
++
++// End of file
++
++diff --git a/lib/widgets/post_actions_menu.dart b/lib/widgets/post_actions_menu.dart
++new file mode 100644
++index 0000000..2222222
++--- /dev/null
+++++ b/lib/widgets/post_actions_menu.dart
++@@ -0,0 +1,170 @@
++// lib/widgets/post_actions_menu.dart
++import 'package:flutter/material.dart';
++import '../services/api_client.dart';
++
++typedef VoidCallbackAsync = Future<void> Function();
++
++class PostActionsMenu extends StatelessWidget {
++  final String postId;
++  final String currentUserId;
++  final bool isOwner;
++  final ApiClient apiClient;
++  final VoidCallback? onDeleted;
++  final String? idToken; // optional
++
++  const PostActionsMenu({
++    Key? key,
++    required this.postId,
++    required this.currentUserId,
++    required this.isOwner,
++    required this.apiClient,
++    this.onDeleted,
++    this.idToken,
++  }) : super(key: key);
++
++  Future<void> _onEdit(BuildContext context) async {
++    final post = await apiClient.getPostForEdit(postId, idToken: idToken);
++    if (post == null) {
++      ScaffoldMessenger.of(context).showSnackBar(
++        const SnackBar(content: Text('Unable to load post for edit')),
++      );
++      return;
++    }
++    // Navigate to create/edit page and pass the post data as an argument.
++    Navigator.of(context).pushNamed('/createPost', arguments: post);
++  }
++
++  Future<void> _onDelete(BuildContext context) async {
++    final confirmed = await showDialog<bool>(
++      context: context,
++      builder: (ctx) => AlertDialog(
++        title: const Text('Delete post'),
++        content: const Text('Are you sure you want to delete this post? This action cannot be undone.'),
++        actions: [
++          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
++          TextButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text('Delete')),
++        ],
++      ),
++    );
++    if (confirmed != true) return;
++
++    final success = await apiClient.deletePost(postId, currentUserId, idToken: idToken);
++    if (success) {
++      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Post deleted')));
++      if (onDeleted != null) onDeleted!();
++    } else {
++      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to delete post')));
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    if (!isOwner) return const SizedBox.shrink();
++    return PopupMenuButton<String>(
++      onSelected: (value) async {
++        if (value == 'edit') {
++          await _onEdit(context);
++        } else if (value == 'delete') {
++          await _onDelete(context);
++        }
++      },
++      itemBuilder: (context) => [
++        const PopupMenuItem(value: 'edit', child: Text('Edit')),
++        const PopupMenuItem(value: 'delete', child: Text('Delete')),
++      ],
++      icon: const Icon(Icons.more_vert),
++    );
++  }
++}
++
++// End of file
++
++diff --git a/README_POST_ACTIONS_PATCH.md b/README_POST_ACTIONS_PATCH.md
++new file mode 100644
++index 0000000..3333333
++--- /dev/null
+++++ b/README_POST_ACTIONS_PATCH.md
++@@ -0,0 +1,200 @@
++# Flutter Post Actions Patch
++
++This patch adds three files you can apply inside the `inzone-flutter-app` repository to add Edit/Delete actions to posts:
++
++- `lib/services/api_client.dart` — small API client with `getPostForEdit` and `deletePost` methods.
++- `lib/widgets/post_actions_menu.dart` — `PostActionsMenu` widget that shows Edit/Delete for post owners.
++- `README_POST_ACTIONS_PATCH.md` — this file with apply instructions.
++
++How to apply
++1. Copy `flutter-post-actions.patch` into the root of your `inzone-flutter-app` repo (or run `curl` to fetch it there).
++2. From the root of `inzone-flutter-app`, run:
++
++```bash
++git apply /path/to/flutter-post-actions.patch
++```
++
++or if you placed the patch file in the repo root:
++
++```bash
++git apply flutter-post-actions.patch
++```
++
++3. Verify the files are added:
++
++```bash
++git status --porcelain
++```
++
++4. Add the files and commit:
++
++```bash
++git add lib/services/api_client.dart lib/widgets/post_actions_menu.dart README_POST_ACTIONS_PATCH.md
++git commit -m "feat: add post actions menu and api client helpers for edit/delete"
++```
++
++5. Update your routing to register the named route `/createPost` (or adjust the widget's push to your existing route name). Ensure `CreatePostPage` reads `ModalRoute.of(context)!.settings.arguments` or accepts the `initialPost` via constructor.
++
++Notes
++- Update `ApiClient(baseUrl: ...)` with your backend URL (use `http://10.0.2.2:<port>` for Android emulator).
++- If you use Firebase auth, pass the user's ID token to `ApiClient` methods to enable server-side verification.
++- The `CreatePostPage` must support prefilling fields and updating an existing post; the patch only navigates and supplies the post JSON as the route `arguments`.
++
++If you want, I can instead produce a patch that modifies existing files (e.g., injects the `PostActionsMenu` into your `PostCard` widget) — for that I will need the exact `PostCard` file path from the Flutter repo.
++
++-- End
++

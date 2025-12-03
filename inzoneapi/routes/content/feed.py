@@ -141,3 +141,29 @@ def get_ai_posts():
         return FeedService.get_ai_posts(username)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@feed_bp.route('/feed/get-post', methods=['GET'])
+def get_post_for_edit():
+    """Get a post for editing"""
+    try:
+        post_id = request.args.get('post_id')
+        if not post_id:
+            return jsonify({"error": "post_id parameter is required"}), 400
+        
+        from services.content.post_service import PostService
+        return PostService.get_post(post_id)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@feed_bp.route('/feed/delete-post', methods=['POST'])
+def delete_post():
+    """Delete a post with ownership verification"""
+    try:
+        data = request.get_json()
+        post_id = data.get('PostId')
+        user_id = data.get('UserId')
+        
+        from services.content.post_service import PostService
+        return PostService.delete_post(post_id, user_id)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
