@@ -379,6 +379,11 @@ def search_posts():
         for coll in ('humanPosts', 'aiPosts'):
             for doc in db.collection(coll).stream():
                 data = doc.to_dict()
+                
+                # Skip deleted posts (only humanPosts have content field)
+                if coll == 'humanPosts' and data.get('content') == '[This post has been deleted by the user]':
+                    continue
+                    
                 post = data.get('post', {}) or {}
                 user_name = data.get('user_name')
                 if coll == 'humanPosts':

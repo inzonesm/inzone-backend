@@ -17,6 +17,9 @@ class PostRetrievalService:
             post_doc = db.collection('humanPosts').document(post_id).get()
             if post_doc.exists:
                 post_data = post_doc.to_dict()
+                # Skip deleted posts
+                if post_data.get('content') == '[This post has been deleted by the user]':
+                    return None
                 post_data['id'] = post_id  # Add document ID to the dict
                 return post_data
 
@@ -78,6 +81,9 @@ class PostRetrievalService:
             post_doc = db.collection('reposts').document(post_id).get()
             if post_doc.exists:
                 post_data = post_doc.to_dict()
+                # Skip deleted posts
+                if post_data.get('content') == '[This post has been deleted by the user]':
+                    return None
                 post_data['id'] = post_id  # Add document ID to the dict
                 return post_data
 
@@ -97,6 +103,9 @@ class PostRetrievalService:
             post_doc = db.collection('humanPosts').document(post_id).get()
             if post_doc.exists:
                 post_data = post_doc.to_dict()
+                # Skip deleted posts
+                if post_data.get('content') == '[This post has been deleted by the user]':
+                    return None
                 post_data['id'] = post_id
                 return post_data
 
@@ -154,6 +163,9 @@ class PostRetrievalService:
             post_doc = db.collection('reposts').document(post_id).get()
             if post_doc.exists:
                 post_data = post_doc.to_dict()
+                # Skip deleted posts
+                if post_data.get('content') == '[This post has been deleted by the user]':
+                    return None
                 post_data['id'] = post_id
                 return post_data
 
