@@ -59,6 +59,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Core application files
 COPY app.py config.py dependencies.py ./
 
+# Copy Firebase credentials
+COPY key.json ./
+
 # Copy application directories
 COPY services/ ./services/
 COPY routes/ ./routes/
