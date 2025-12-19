@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import firebase_admin
-from firebase_admin import firestore
+from firebase_admin import firestore, auth
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -41,14 +41,14 @@ class EngagementLimits:
     comments_max: int = 4
     likes_min: int = 5
     likes_max: int = 7
-    dms_max: int = 1
+    dms_max: int = 10  # Increased for re-engagement system
 
 @dataclass
 class CooldownRules:
     """Cooldown rules for AI interactions"""
     same_user_comment_hours: int = 24
     dm_no_reply_days: int = 3
-    user_interaction_min_hours: int = 48  # 2-3 days minimum
+    user_interaction_min_hours: int = 48
     user_interaction_max_hours: int = 72
     max_daily_interactions_per_user: int = 2
 
@@ -258,12 +258,6 @@ class AIScheduler:
                     if interaction_type_stored == 'dm' and hours_since < 24:
                         logger.debug(f"DM cooldown active: {ai_id} -> {target_user_id}, last DM {hours_since:.1f} hours ago")
                         return False
-                    
-                    # Also check if user has received too many DMs from ANY AI recently
-                    recent_dm_count = self.count_recent_dms_to_user(target_user_id, hours=4)
-                    if recent_dm_count >= 2:  # Max 2 DMs from any AI in 4 hours
-                        logger.debug(f"User {target_user_id} has received {recent_dm_count} DMs in last 4 hours - cooling down")
-                        return False
                 
                 elif interaction_type == EngagementType.COMMENT:
                     # Comment cooldown: 12 hours minimum between comments from same AI to same user's posts
@@ -314,6 +308,54 @@ class AIScheduler:
         except Exception as e:
             logger.error(f"Error counting recent DMs for user {user_id}: {e}")
             return 0
+    
+    def _get_first_reengagement_dm_time(self, ai_id: str, user_id: str) -> Optional[datetime]:
+        """
+        Get the timestamp of the first re-engagement DM sent to this user from ANY AI.
+        Used to enforce 2-week cutoff for re-engagement attempts.
+        Returns None if no re-engagement DMs have been sent.
+        """
+        try:
+            # Query for DM interactions to this user where user was inactive
+            # We'll check if the interaction details indicate it was a re-engagement DM
+            interactions_ref = self.db.collection('aiInteractions')\
+                                     .where('target_user_id', '==', user_id)\
+                                     .where('interaction_type', '==', 'dm')
+            
+            # Note: We can't use .order_by('timestamp') without a Firestore index
+            # Instead, get all DM interactions and find the earliest re-engagement one in memory
+            earliest_reengagement = None
+            
+            for interaction_doc in interactions_ref.stream():
+                interaction_data = interaction_doc.to_dict()
+                details = interaction_data.get('details', {})
+                
+                # Check if this was a re-engagement DM
+                # (we mark these in log_interaction when hours_away >= 24)
+                if details.get('is_reengagement') or details.get('hours_away', 0) >= 24:
+                    timestamp = interaction_data.get('timestamp')
+                    
+                    if timestamp:
+                        if isinstance(timestamp, str):
+                            try:
+                                parsed_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            except:
+                                continue
+                        elif hasattr(timestamp, 'tzinfo'):
+                            parsed_time = timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else timestamp
+                        else:
+                            continue
+                        
+                        # Track the earliest re-engagement DM
+                        if earliest_reengagement is None or parsed_time < earliest_reengagement:
+                            earliest_reengagement = parsed_time
+            
+            return earliest_reengagement
+            
+        except Exception as e:
+            # If query fails (e.g., no interactions exist), user has never been re-engaged
+            logger.debug(f"No re-engagement DM history for user {user_id}: {e}")
+            return None
     
     def analyze_dm_distribution(self, hours: int = 24) -> Dict:
         """Analyze recent DM distribution to help debug clustering issues"""
@@ -437,13 +479,24 @@ class AIScheduler:
             return []
     
     def get_eligible_users_for_dm(self, ai_id: str, limit: int = 50) -> List[Dict]:
-        """Get eligible users for DM interactions with proper distribution"""
+        """
+        Get eligible users for DM interactions with proper distribution.
+        Prioritizes users who have been away from the app for 24+ hours (Duolingo-style re-engagement).
+        Stops sending re-engagement DMs after 2 weeks from the first re-engagement attempt.
+        """
         try:
+            import random
+            
             # Get active human users - get more to ensure variety
             users_ref = self.db.collection('humanUsers').limit(limit * 5)  # Get 5x more for better selection
-            all_users = []
             
-            # First, collect all potential users
+            inactive_users = []  # Users away 24h+ (priority)
+            active_users = []    # Users active within 24h
+            
+            now = datetime.now(timezone.utc)
+            inactive_threshold = now - timedelta(hours=24)  # 24 hours ago
+            
+            # Collect and categorize all potential users
             for user_doc in users_ref.stream():
                 user_id = user_doc.id
                 user_data = user_doc.to_dict()
@@ -453,38 +506,135 @@ class AIScheduler:
                     continue
                 
                 # Basic validation - user has name or username
-                if user_data.get('name') or user_data.get('username'):
-                    all_users.append({
+                if not (user_data.get('name') or user_data.get('username')):
+                    logger.debug(f"⏭️  Skipping user {user_id}: no name or username in Firestore data")
+                    continue
+                
+                # Check if user has been in re-engagement for >2 weeks (stop sending)
+                first_reengagement_dm = self._get_first_reengagement_dm_time(ai_id, user_id)
+                if first_reengagement_dm:
+                    days_since_first_reengagement = (now - first_reengagement_dm).days
+                    if days_since_first_reengagement >= 14:
+                        logger.info(f"⏭️  Skipping {user_data.get('name', user_id)}: 2 weeks since first re-engagement DM ({days_since_first_reengagement} days)")
+                        continue
+                else:
+                    # No prior re-engagement DM - this will be the FIRST attempt
+                    # The 2-week countdown starts when this DM is logged with is_reengagement=True
+                    logger.debug(f"First re-engagement attempt will be for {user_data.get('name', user_id)}")
+                
+                # Get last sign-in time from Firebase Auth
+                try:
+                    auth_user = auth.get_user(user_id)
+                    last_sign_in_timestamp = auth_user.user_metadata.last_sign_in_timestamp
+                    
+                    if last_sign_in_timestamp:
+                        # Firebase Auth stores timestamp in milliseconds
+                        last_sign_in = datetime.fromtimestamp(last_sign_in_timestamp / 1000, tz=timezone.utc)
+                        hours_away = (now - last_sign_in).total_seconds() / 3600
+                        days_away = hours_away / 24
+                        
+                        user_entry = {
+                            'user_id': user_id,
+                            'user_data': user_data,
+                            'target_type': 'user',
+                            'last_sign_in': last_sign_in,
+                            'hours_away': hours_away,
+                            'days_away': days_away
+                        }
+                        
+                        # Categorize: inactive (24h+) or active (<24h)
+                        if last_sign_in < inactive_threshold:
+                            # User inactive for 24h+ - HIGH PRIORITY for re-engagement
+                            inactive_users.append(user_entry)
+                            logger.info(f"🎯 Inactive user found: {user_data.get('name', user_id)} - {hours_away:.1f} hours ({days_away:.1f} days) away")
+                        else:
+                            # User active within 24h
+                            active_users.append(user_entry)
+                            logger.debug(f"✅ Active user: {user_data.get('name', user_id)} - {hours_away:.1f} hours away")
+                    else:
+                        # No sign-in timestamp - treat as new/active user
+                        active_users.append({
+                            'user_id': user_id,
+                            'user_data': user_data,
+                            'target_type': 'user',
+                            'hours_away': 0,
+                            'days_away': 0
+                        })
+                        logger.debug(f"ℹ️  New user (no sign-in history): {user_data.get('name', user_id)}")
+                        
+                except Exception as e:
+                    # If Firebase Auth lookup fails, treat as active user (fail-safe)
+                    user_name = user_data.get('name', user_data.get('username', user_id))
+                    logger.warning(f"⚠️  Could not get Firebase Auth data for user {user_id} ({user_name}): {e}")
+                    logger.warning(f"   This may be an orphaned Firestore document (Firebase Auth account deleted)")
+                    active_users.append({
                         'user_id': user_id,
                         'user_data': user_data,
-                        'target_type': 'user'
+                        'target_type': 'user',
+                        'hours_away': 0,
+                        'days_away': 0
                     })
             
-            # Randomize the user list to ensure variety
-            import random
-            random.shuffle(all_users)
+            # Log summary of user categorization
+            logger.info(f"📊 User Analysis for AI {ai_id}:")
+            logger.info(f"   - Inactive users (24h+): {len(inactive_users)}")
+            logger.info(f"   - Active users (<24h): {len(active_users)}")
+            
+            # Prioritize inactive users for re-engagement (Duolingo-style)
+            # Shuffle both lists for uniform distribution
+            random.shuffle(inactive_users)
+            random.shuffle(active_users)
+            
+            # Combine: inactive users first, then active users
+            all_users_prioritized = inactive_users + active_users
             
             # Now filter based on cooldowns
             eligible_targets = []
-            for user in all_users:
-                # Check cooldowns (now actually implemented)
+            cooldown_filtered = 0
+            for user in all_users_prioritized:
+                # Check cooldowns
                 if not self.check_interaction_cooldown(ai_id, user['user_id'], EngagementType.DM):
+                    hours_away = user.get('hours_away', 0)
+                    user_name = user['user_data'].get('name', user['user_id'])
+                    logger.info(f"⏭️  COOLDOWN FILTER: Skipped {user_name} ({hours_away:.1f}h away) - THIS AI already DMed this user within 24h")
+                    cooldown_filtered += 1
                     continue
                 
                 eligible_targets.append(user)
+                
+                # Log selected target with away time
+                hours_away = user.get('hours_away', 0)
+                days_away = user.get('days_away', 0)
+                user_name = user['user_data'].get('name', user['user_id'])
+                
+                if hours_away >= 24:
+                    logger.info(f"✅ Selected INACTIVE user for DM: {user_name} - {hours_away:.1f}h ({days_away:.1f}d) away")
+                else:
+                    logger.info(f"✅ Selected active user for DM: {user_name} - {hours_away:.1f}h away")
                 
                 # Stop when we have enough eligible targets
                 if len(eligible_targets) >= limit:
                     break
             
-            # Add randomization to final selection
-            random.shuffle(eligible_targets)
+            # Final summary
+            inactive_selected = len([u for u in eligible_targets if u.get('hours_away', 0) >= 24])
+            active_selected = len(eligible_targets) - inactive_selected
             
-            logger.info(f"Selected {len(eligible_targets)} eligible DM targets for AI {ai_id} from {len(all_users)} total users")
+            logger.info(f"")
+            logger.info(f"🎯 FINAL SELECTION for AI {ai_id}:")
+            logger.info(f"   - {inactive_selected} inactive users (24h+) selected")
+            logger.info(f"   - {active_selected} active users selected")
+            logger.info(f"   - {len(eligible_targets)} total DM targets")
+            if cooldown_filtered > 0:
+                logger.info(f"   - {cooldown_filtered} users filtered by 24h cooldown (THIS AI already DMed them recently)")
+            logger.info(f"")
+            
             return eligible_targets[:limit]
             
         except Exception as e:
-            logger.error(f"Error getting eligible users for DM: {e}")
+            logger.error(f"❌ Error getting eligible users for DM: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
     
     def get_eligible_posts_for_engagement(self, ai_id: str, interaction_type: EngagementType, limit: int = 50) -> List[Dict]:
@@ -635,6 +785,12 @@ class AIScheduler:
                 'dms': max(0, targets['dms'] - daily_counts['dms'])
             }
             
+            # Log daily limits info
+            logger.info(f"\n📋 Daily Engagement Status for {char_name}:")
+            logger.info(f"   - DMs: {daily_counts['dms']}/{targets['dms']} sent (remaining: {remaining_targets['dms']})")
+            logger.info(f"   - Comments: {daily_counts['comments']}/{targets['comments']} sent (remaining: {remaining_targets['comments']})")
+            logger.info(f"   - Likes: {daily_counts['likes']}/{targets['likes']} sent (remaining: {remaining_targets['likes']})")
+            
             scheduled_interactions = []
             
             # Schedule remaining interactions
@@ -672,6 +828,7 @@ class AIScheduler:
                     else:
                         # For users (DMs)
                         target_user_name = target['user_data'].get('name', target['user_data'].get('username', 'Unknown'))
+                        hours_away = target.get('hours_away', 0)
                         scheduled_interactions.append({
                             'character_id': character_id,
                             'character_name': char_name,
@@ -679,11 +836,15 @@ class AIScheduler:
                             'target_user_name': target_user_name,  # Add user name for logging
                             'interaction_type': interaction_type.value,
                             'engagement_score': target.get('engagement_score', 1.0),
-                            'time_window': self.get_time_window().value
+                            'time_window': self.get_time_window().value,
+                            'hours_away': hours_away  # Track for re-engagement
                         })
                         
                         # Log the DM target selection for debugging
-                        logger.info(f"Scheduled DM: {char_name} -> {target_user_name} ({target['user_id']})")
+                        if hours_away >= 24:
+                            logger.info(f"Scheduled RE-ENGAGEMENT DM: {char_name} -> {target_user_name} ({hours_away:.1f}h away)")
+                        else:
+                            logger.info(f"Scheduled DM: {char_name} -> {target_user_name} ({target['user_id']})")
             
             return {
                 'success': True,
@@ -888,7 +1049,8 @@ class AIScheduler:
                         elif interaction_type == 'dm':
                             success = self.execute_dm_interaction(
                                 character_id,
-                                interaction['target_user_id']
+                                interaction['target_user_id'],
+                                hours_away=interaction.get('hours_away', 0)
                             )
                         
                         if success:
@@ -1072,7 +1234,7 @@ class AIScheduler:
         """Execute a comment interaction using the proper InZoneAIEngagementService. Searches both humanPosts and aiPosts."""
         try:
             # Import the proper AI service
-            from inzone_ai_engagement import InZoneAIEngagementService
+            from services.ai.engagement.inzone_ai_engagement import InZoneAIEngagementService
             from openai import OpenAI
             import os
             
@@ -1234,11 +1396,16 @@ class AIScheduler:
             logger.error(f"Error executing comment interaction: {e}")
             return False
     
-    def execute_dm_interaction(self, character_id: str, target_user_id: str) -> bool:
-        """Execute a DM interaction using the proper InZoneAIEngagementService"""
+    def execute_dm_interaction(self, character_id: str, target_user_id: str, hours_away: float = 0) -> bool:
+        """Execute a DM interaction using the proper InZoneAIEngagementService""
+        Args:
+            character_id: AI character sending the DM
+            target_user_id: User receiving the DM
+            hours_away: Hours since user last signed in (0 if active, 24+ if re-engagement)
+        """
         try:
             # Import the proper AI service
-            from inzone_ai_engagement import InZoneAIEngagementService
+            from services.ai.engagement.inzone_ai_engagement import InZoneAIEngagementService
             from openai import OpenAI
             import os
             
@@ -1304,10 +1471,13 @@ class AIScheduler:
                 'lastUpdated': firestore.SERVER_TIMESTAMP,
             }, merge=True)
             
-            # Log the interaction
+            # Log the interaction with re-engagement flag if applicable
+            is_reengagement = hours_away >= 24
             self.log_interaction(character_id, target_user_id, EngagementType.DM, {
                 'conversation_id': conversation_id,
-                'message': dm_content
+                'message': dm_content,
+                'is_reengagement': is_reengagement,
+                'hours_away': hours_away
             })
             
             # Create notification for the DM recipient
@@ -1477,7 +1647,7 @@ class AIScheduler:
             logger.info(f"🚀 Starting immediate DM response: {ai_id} -> {human_id}")
             
             # Import the proper AI service
-            from inzone_ai_engagement import InZoneAIEngagementService
+            from services.ai.engagement.inzone_ai_engagement import InZoneAIEngagementService
             from openai import OpenAI
             import os
             

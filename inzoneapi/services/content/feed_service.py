@@ -611,11 +611,12 @@ class FeedService:
             # DEFAULT CATEGORIES: If user has no interests, use beginner-friendly categories
             # These categories have broad appeal and high engagement
             DEFAULT_COLD_START_CATEGORIES = [
-                "entertainment_memes",      # Universal appeal
-                "learning_education",       # Educational content
-                "creativity_art",           # Visual content
-                "pets_wildlife",           # Animal content (highly engaging)
-                "travel_adventure"         # Aspirational content
+                "comedy_humor_memes",           # Universal appeal
+                "education_learning",           # Educational content
+                "arts_design",                  # Visual content
+                "pets_animals",                 # Animal content (highly engaging)
+                "travel_places",                # Aspirational content
+                "entertainment_pop_culture"     # Trending content
             ]
 
             if not user_labels:
@@ -903,6 +904,12 @@ class FeedService:
 
             human_posts_all = fetch_posts('humanPosts')
 
+            # Filter out deleted posts from human posts (check content field)
+            human_posts_all = [
+                post for post in human_posts_all
+                if post.get('content') != '[This post has been deleted by the user]'
+            ]
+
             human_count = len(human_posts_all)
 
             ai_posts_all = (
@@ -912,6 +919,12 @@ class FeedService:
             )
 
             reposts_all = fetch_posts('reposts')
+            
+            # Filter out deleted posts from reposts (check content field)
+            reposts_all = [
+                post for post in reposts_all
+                if post.get('content') != '[This post has been deleted by the user]'
+            ]
 
             print(f"Total posts fetched - AI: {len(ai_posts_all)}, Human: {len(human_posts_all)}, Reposts: {len(reposts_all)}")
 
@@ -1263,6 +1276,12 @@ class FeedService:
                 query = db.collection(collection).where("user_document_id", "==", user_id).limit(25)
                 snapshot = query.stream()
                 posts.extend([doc.to_dict() for doc in snapshot])
+
+            # Filter out deleted posts (check content field)
+            posts = [
+                post for post in posts
+                if post.get('content') != '[This post has been deleted by the user]'
+            ]
 
             posts.sort(key=lambda x: x['date_posted'], reverse=True)
 

@@ -1,0 +1,19 @@
+# Requirements for scripts in this directory
+
+# Firebase Admin SDK - Required
+firebase-admin>=6.2.0
+
+# Google Cloud Storage - Required for video migration
+google-cloud-storage>=2.10.0
+
+# OpenCV for video codec validation - Highly Recommended
+opencv-python>=4.8.0
+
+# HTTP requests for URL validation - Required
+requests>=2.31.0
+
+# YouTube video downloader - Required for migrate_youtube_to_storage.py
+yt-dlp>=2024.1.0
+
+# Optional: Progress bar for large collections
+tqdm>=4.66.0

@@ -7,7 +7,7 @@ A multi-component social media platform with AI-powered features, agent manageme
 **Want to run, test, or deploy the InZone API?** Use the interactive deployment script:
 
 ```bash
-cd inzoneapi
+cd inzoneapi/scripts
 python deploy.py
 ```
 
