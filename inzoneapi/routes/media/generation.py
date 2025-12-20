@@ -121,6 +121,7 @@ def get_avatar(avatar_id: str):
             }), 404
         
         # Extract GLB URLs (prefer storage URLs)
+        base_avatar = avatar_data.get("base_avatar", {}) or {}
         clothed_avatar = avatar_data.get("clothed_avatar", {}) or {}
         status = avatar_data.get("status", "processing")
         retry_info = avatar_data.get("retry_info", {})
@@ -144,6 +145,10 @@ def get_avatar(avatar_id: str):
             response_data["retry_info"] = retry_info
         
         # Add avatar data if available
+        if base_avatar:
+            response_data["data"]["base_avatar"] = base_avatar
+            response_data["data"]["base_glb_url"] = base_avatar.get("storage_glb_url") or base_avatar.get("model_glb")
+        
         if clothed_avatar:
             response_data["data"]["clothed_avatar"] = clothed_avatar
             response_data["data"]["clothed_glb_url"] = clothed_avatar.get("storage_glb_url") or clothed_avatar.get("model_glb")
@@ -175,6 +180,49 @@ def get_avatar(avatar_id: str):
         
     except Exception as e:
         logger.error(f"Error retrieving avatar: {e}")
+        return jsonify({
+            "error": "Internal server error",
+            "code": "INTERNAL_ERROR"
+        }), 500
+
+@media_generation_bp.route("/api/get-avatar-signed-urls/<avatar_id>", methods=["GET"])
+def get_avatar_signed_urls(avatar_id: str):
+    """
+    Get signed URLs for all avatar GLB files for Unity loading.
+    
+    Query params:
+        expiration_minutes: Optional expiration time in minutes (default: 60)
+    
+    Returns:
+        Dictionary with signed URLs for all avatar versions
+    """
+    try:
+        if not avatar_id:
+            return jsonify({
+                "error": "Missing avatar_id",
+                "code": "INVALID_REQUEST"
+            }), 400
+        
+        # Get optional expiration time from query params
+        expiration_minutes = request.args.get("expiration_minutes", type=int, default=60)
+        if expiration_minutes < 1 or expiration_minutes > 1440:  # Max 24 hours
+            expiration_minutes = 60
+        
+        result = MediaGenerationService.get_avatar_signed_urls(avatar_id, expiration_minutes)
+        
+        if not result:
+            return jsonify({
+                "error": "Avatar not found",
+                "code": "NOT_FOUND"
+            }), 404
+        
+        return jsonify({
+            "success": True,
+            **result
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting signed URLs for avatar {avatar_id}: {e}")
         return jsonify({
             "error": "Internal server error",
             "code": "INTERNAL_ERROR"

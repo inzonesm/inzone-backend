@@ -395,7 +395,8 @@ class MediaGenerationService:
 
     @staticmethod
     def _generate_single_avatar(prompt: str, avatar_type: str, art_style: Optional[str] = None, 
-                                ai_model: Optional[str] = None, avatar_id: Optional[str] = None) -> Dict[str, Any]:
+                                ai_model: Optional[str] = None, avatar_id: Optional[str] = None,
+                                is_humanoid: bool = True, user_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Generate a single avatar (base or clothed) using Meshy API.
         
@@ -452,63 +453,215 @@ class MediaGenerationService:
             texture_base_color_url = texture_urls[0].get("base_color") if texture_urls else None
             
             # Stage 3: Rigging (for humanoid avatars)
-            if avatar_id:
-                stage = f"{avatar_type}_rigging"
-                MediaGenerationService._update_progress(avatar_id, stage,
-                   30,
-                   f"{avatar_type.capitalize()} avatar rigging in progress...")
-            
-            logger.info(f"[{avatar_type}] Starting rigging task for refine_id: {refine_id}")
-            
-            try:
-                # Create rigging task using the refine task ID
-                rigging_id = MediaGenerationService.create_rigging_task(
-                    input_task_id=refine_id,
-                    height_meters=1.7  # Default height, can be customized based on spec later
-                )
-                logger.info(f"[{avatar_type}] Rigging task started: {rigging_id}")
+            if is_humanoid:
+                if avatar_id:
+                    stage = f"{avatar_type}_rigging"
+                    MediaGenerationService._update_progress(avatar_id, stage,
+                       30,
+                       f"{avatar_type.capitalize()} avatar rigging in progress...")
                 
-                # Wait for rigging to complete
-                task_rigging = MediaGenerationService.wait_for_rigging(rigging_id, timeout_s=20*60, poll_s=5)
-                logger.info(f"[{avatar_type}] Rigging completed")
+                logger.info(f"[{avatar_type}] Starting rigging task for refine_id: {refine_id}")
                 
-                # Extract rigged model URL (prefer rigged GLB over unrigged)
-                rigged_urls = task_rigging.get("model_urls") or {}
-                rigged_glb = rigged_urls.get("glb") or urls.get("glb")  # Fallback to unrigged if rigged URL missing
+                try:
+                    # Create rigging task using the refine task ID
+                    rigging_id = MediaGenerationService.create_rigging_task(
+                        input_task_id=refine_id,
+                        height_meters=1.7  # Default height, can be customized based on spec later
+                    )
+                    logger.info(f"[{avatar_type}] Rigging task started: {rigging_id}")
+                    
+                    # Wait for rigging to complete
+                    task_rigging = MediaGenerationService.wait_for_rigging(rigging_id, timeout_s=20*60, poll_s=5)
+                    logger.info(f"[{avatar_type}] Rigging completed")
+                    
+                    # Stage 4: Animation (for humanoid avatars with action_id 243)
+                    if avatar_id:
+                        stage = f"{avatar_type}_animation"
+                        MediaGenerationService._update_progress(avatar_id, stage,
+                           50,
+                           f"{avatar_type.capitalize()} avatar animation in progress...")
+                    
+                    logger.info(f"[{avatar_type}] Starting animation task for rigging_id: {rigging_id} with action_id 243")
+                    
+                    try:
+                        # Apply animation with action_id 243
+                        animation_id = MediaGenerationService.apply_animation_to_character(
+                            rig_task_id=rigging_id,
+                            action_id=243
+                        )
+                        logger.info(f"[{avatar_type}] Animation task started: {animation_id}")
+                        
+                        # Wait for animation to complete
+                        task_animation = MediaGenerationService.wait_for_animation_apply(animation_id, timeout_s=20*60, poll_s=5)
+                        logger.info(f"[{avatar_type}] Animation completed")
+                        
+                        # Extract all GLB URLs for different versions
+                        regular_glb = urls.get("glb")  # Unrigged from refine
+                        rigged_urls = task_rigging.get("model_urls") or {}
+                        rigged_glb = rigged_urls.get("glb")  # Rigged (includes walking animation)
+                        animated_urls = task_animation.get("model_urls") or {}
+                        idle_glb = animated_urls.get("glb")  # Idle animation (action 243)
+                        walking_glb = rigged_glb  # Walking uses rigged GLB (assumed to include walking)
+                        
+                        # Upload all versions to storage
+                        result = {
+                            "status": "SUCCEEDED",
+                            "task_ids": {
+                                "preview": preview_id,
+                                "refine": refine_id,
+                                "rigging": rigging_id,
+                                "animation": animation_id
+                            },
+                            "model_glb": idle_glb or rigged_glb or regular_glb,  # Primary GLB (prefer idle)
+                            "regular_glb": regular_glb,
+                            "rigged_glb": rigged_glb,
+                            "idle_glb": idle_glb,
+                            "walking_glb": walking_glb,
+                            "model_obj": urls.get("obj"),  # Keep original OBJ
+                            "texture_base_color": texture_base_color_url,
+                            "thumbnail_url": task_refine.get("thumbnail_url"),
+                            "progress": task_animation.get("progress") or task_rigging.get("progress") or task_refine.get("progress"),
+                            "rigged": True,  # Flag to indicate this is rigged
+                            "animated": True,  # Flag to indicate this is animated
+                            "action_id": 243
+                        }
+                        
+                        # Upload all versions to storage if user_id is available
+                        if user_id and avatar_id:
+                            MediaGenerationService._upload_all_avatar_versions(
+                                avatar_result=result,
+                                avatar_id=avatar_id,
+                                user_id=user_id,
+                                urls=urls,
+                                task_rigging=task_rigging,
+                                task_animation=task_animation
+                            )
+                        
+                        return result
+                    except Exception as animation_error:
+                        # If animation fails, log warning but continue with rigged model
+                        logger.warning(f"[{avatar_type}] Animation failed, using rigged model: {animation_error}")
+                        
+                        # Extract all available GLB URLs
+                        regular_glb = urls.get("glb")  # Unrigged from refine
+                        rigged_urls = task_rigging.get("model_urls") or {}
+                        rigged_glb = rigged_urls.get("glb") or regular_glb
+                        walking_glb = rigged_glb  # Walking uses rigged GLB
+                        
+                        result = {
+                            "status": "SUCCEEDED",
+                            "task_ids": {
+                                "preview": preview_id,
+                                "refine": refine_id,
+                                "rigging": rigging_id,
+                                "animation": None  # Animation failed
+                            },
+                            "model_glb": rigged_glb,  # Use rigged GLB as fallback
+                            "regular_glb": regular_glb,
+                            "rigged_glb": rigged_glb,
+                            "idle_glb": None,  # No idle animation
+                            "walking_glb": walking_glb,
+                            "model_obj": urls.get("obj"),
+                            "texture_base_color": texture_base_color_url,
+                            "thumbnail_url": task_refine.get("thumbnail_url"),
+                            "progress": task_rigging.get("progress") or task_refine.get("progress"),
+                            "rigged": True,  # Flag to indicate this is rigged
+                            "animated": False,  # Flag to indicate animation failed
+                            "animation_error": str(animation_error),
+                            "action_id": 243
+                        }
+                        
+                        # Upload available versions to storage (no idle since animation failed)
+                        if user_id and avatar_id:
+                            MediaGenerationService._upload_all_avatar_versions(
+                                avatar_result=result,
+                                avatar_id=avatar_id,
+                                user_id=user_id,
+                                urls=urls,
+                                task_rigging=task_rigging,
+                                task_animation=None  # No animation task
+                            )
+                        
+                        return result
+                except Exception as rigging_error:
+                    # If rigging fails, log warning but continue with unrigged model
+                    logger.warning(f"[{avatar_type}] Rigging failed, using unrigged model: {rigging_error}")
+                    
+                    regular_glb = urls.get("glb")  # Only unrigged available
+                    
+                    result = {
+                        "status": "SUCCEEDED",
+                        "task_ids": {
+                            "preview": preview_id,
+                            "refine": refine_id,
+                            "rigging": None,  # Rigging failed
+                            "animation": None  # No animation since rigging failed
+                        },
+                        "model_glb": regular_glb,  # Use unrigged GLB as fallback
+                        "regular_glb": regular_glb,
+                        "rigged_glb": None,  # No rigged version
+                        "idle_glb": None,  # No idle animation
+                        "walking_glb": None,  # No walking animation
+                        "model_obj": urls.get("obj"),
+                        "texture_base_color": texture_base_color_url,
+                        "thumbnail_url": task_refine.get("thumbnail_url"),
+                        "progress": task_refine.get("progress"),
+                        "rigged": False,  # Flag to indicate rigging failed
+                        "animated": False,  # Flag to indicate no animation
+                        "rigging_error": str(rigging_error)
+                    }
+                    
+                    # Upload only regular version to storage
+                    if user_id and avatar_id:
+                        MediaGenerationService._upload_all_avatar_versions(
+                            avatar_result=result,
+                            avatar_id=avatar_id,
+                            user_id=user_id,
+                            urls=urls,
+                            task_rigging=None,  # No rigging task
+                            task_animation=None  # No animation task
+                        )
+                    
+                    return result
+            else:
+                # Non-humanoid avatar - skip rigging and animation
+                logger.info(f"[{avatar_type}] Non-humanoid avatar, skipping rigging and animation")
                 
-                return {
+                regular_glb = urls.get("glb")
+                
+                result = {
                     "status": "SUCCEEDED",
                     "task_ids": {
                         "preview": preview_id,
                         "refine": refine_id,
-                        "rigging": rigging_id
+                        "rigging": None,  # No rigging for non-humanoid
+                        "animation": None  # No animation for non-humanoid
                     },
-                    "model_glb": rigged_glb,  # Use rigged GLB
-                    "model_obj": urls.get("obj"),  # Keep original OBJ
-                    "texture_base_color": texture_base_color_url,
-                    "thumbnail_url": task_refine.get("thumbnail_url"),
-                    "progress": task_rigging.get("progress") or task_refine.get("progress"),
-                    "rigged": True  # Flag to indicate this is rigged
-                }
-            except Exception as rigging_error:
-                # If rigging fails, log warning but continue with unrigged model
-                logger.warning(f"[{avatar_type}] Rigging failed, using unrigged model: {rigging_error}")
-                
-                return {
-                    "status": "SUCCEEDED",
-                    "task_ids": {
-                        "preview": preview_id,
-                        "refine": refine_id,
-                        "rigging": None  # Rigging failed
-                    },
-                    "model_glb": urls.get("glb"),  # Use unrigged GLB as fallback
+                    "model_glb": regular_glb,
+                    "regular_glb": regular_glb,
+                    "rigged_glb": None,  # No rigged for non-humanoid
+                    "idle_glb": None,  # No idle for non-humanoid
+                    "walking_glb": None,  # No walking for non-humanoid
                     "model_obj": urls.get("obj"),
                     "texture_base_color": texture_base_color_url,
                     "thumbnail_url": task_refine.get("thumbnail_url"),
                     "progress": task_refine.get("progress"),
-                    "rigged": False,  # Flag to indicate rigging failed
-                    "rigging_error": str(rigging_error)
+                    "rigged": False,  # Flag to indicate not rigged
+                    "animated": False  # Flag to indicate not animated
                 }
+                
+                # Upload only regular version to storage
+                if user_id and avatar_id:
+                    MediaGenerationService._upload_all_avatar_versions(
+                        avatar_result=result,
+                        avatar_id=avatar_id,
+                        user_id=user_id,
+                        urls=urls,
+                        task_rigging=None,  # No rigging for non-humanoid
+                        task_animation=None  # No animation for non-humanoid
+                    )
+                
+                return result
         except Exception as e:
             logger.error(f"[{avatar_type}] Avatar generation failed: {e}")
             raise
@@ -549,7 +702,9 @@ class MediaGenerationService:
     def _generate_single_avatar_with_retry(prompt: str, avatar_type: str, avatar_id: str,
                                            art_style: Optional[str] = None, 
                                            ai_model: Optional[str] = None,
-                                           max_retries: int = 3) -> Tuple[Optional[Dict[str, Any]], int]:
+                                           max_retries: int = 3,
+                                           is_humanoid: bool = True,
+                                           user_id: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], int]:
         """
         Generate a single avatar with automatic retry on failure.
         
@@ -582,7 +737,8 @@ class MediaGenerationService:
                     avatar_type=avatar_type,
                     art_style=art_style,
                     ai_model=ai_model,
-                    avatar_id=avatar_id
+                    avatar_id=avatar_id,
+                    is_humanoid=is_humanoid
                 )
                 
                 # Success - return result with retry count
@@ -605,23 +761,11 @@ class MediaGenerationService:
 
     @staticmethod
     def create_rigging_task(*,
-                            input_task_id: Optional[str] = None,
-                            model_url: Optional[str] = None,
-                            height_meters: float = 1.7,
-                            texture_image_url: Optional[str] = None) -> str:
-        """
-        Create a rigging task for a generated avatar.
-        
-        Args:
-            input_task_id: The refine task ID from Meshy (preferred)
-            model_url: Direct model URL (alternative to input_task_id)
-            height_meters: Height of the avatar in meters (default 1.7)
-            texture_image_url: Optional texture image URL
-            
-        Returns:
-            Rigging task ID
-        """
-        if input_task_id is None and model_url is None:
+                        input_task_id: Optional[str] = None,
+                        model_url: Optional[str] = None,
+                        height_meters: float = 1.7,
+                        texture_image_url: Optional[str] = None):
+        if (input_task_id is None) == (model_url is None):
             raise ValueError("Provide exactly one of: input_task_id OR model_url")
 
         payload: Dict[str, Any] = {
@@ -637,20 +781,18 @@ class MediaGenerationService:
 
         r = requests.post(f"{BASE_URL}/openapi/v1/rigging", headers=MediaGenerationService._headers(), json=payload, timeout=60)
         r.raise_for_status()
-        task_id = r.json()["result"]
+        data = r.json()
+        result = data.get("result", data)
+        if isinstance(result, dict):
+            task_id = result.get("task_id") or result.get("id") or result.get("result")
+        else:
+            task_id = result
+        if not task_id:
+            raise RuntimeError(f"Could not parse rigging task id. keys={list(data.keys())}, data={data}")
         return task_id
 
     @staticmethod
     def get_rigging_task(task_id: str) -> Dict[str, Any]:
-        """
-        Get the status of a rigging task.
-        
-        Args:
-            task_id: The rigging task ID
-            
-        Returns:
-            Task status dictionary
-        """
         r = requests.get(f"{BASE_URL}/openapi/v1/rigging/{task_id}", headers=MediaGenerationService._headers(), timeout=60)
         r.raise_for_status()
         return r.json()
@@ -659,60 +801,197 @@ class MediaGenerationService:
     def wait_for_rigging(task_id: str, *, timeout_s: int = 20 * 60, poll_s: int = 5) -> Dict[str, Any]:
         """
         Polls until SUCCEEDED/FAILED or timeout.
-        
-        Args:
-            task_id: The rigging task ID
-            timeout_s: Maximum time to wait in seconds (default 20 minutes)
-            poll_s: Polling interval in seconds (default 5)
-            
-        Returns:
-            Completed task dictionary with rigged model URL
         """
         start = time.time()
         while True:
             task = MediaGenerationService.get_rigging_task(task_id)
             status = task.get("status")
             progress = task.get("progress")
-            logger.info(f"[rigging] Task {task_id}: status={status}, progress={progress}")
+            logger.info(f"[rigging] status={status} progress={progress}")
 
             if status == "SUCCEEDED":
                 return task
             if status in ("FAILED", "CANCELED"):
                 err = (task.get("task_error") or {}).get("message")
                 raise RuntimeError(f"Rigging failed: {err or task}")
-            
+
             if time.time() - start > timeout_s:
                 raise TimeoutError(f"Rigging timed out after {timeout_s}s: {task_id}")
+
+                    time.sleep(poll_s)
+
+    @staticmethod
+    def apply_animation_to_character(*, rig_task_id: str, action_id: int):
+        if action_id is None:
+            raise ValueError("Provide exactly one of action_id")
+
+        payload = {"rig_task_id": rig_task_id, "action_id": action_id}
+
+        r = requests.post(f"{BASE_URL}/openapi/v1/animations", headers=MediaGenerationService._headers(), json=payload, timeout=60)
+        logger.info(f"[animation] STATUS: {r.status_code} {r.text}")
+        r.raise_for_status()
+        return r.json()["result"]  # this is the task ID
+
+    @staticmethod
+    def get_animation_task(task_id: str) -> Dict[str, Any]:
+        r = requests.get(f"{BASE_URL}/openapi/v1/animations/{task_id}", headers=MediaGenerationService._headers(), timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    @staticmethod
+    def wait_for_animation_apply(task_id: str, *, timeout_s: int = 20 * 60, poll_s: int = 5) -> Dict[str, Any]:
+        """
+        Polls until SUCCEEDED/FAILED or timeout.
+        """
+        start = time.time()
+        while True:
+            task = MediaGenerationService.get_animation_task(task_id)
+            status = task.get("status")
+            progress = task.get("progress")
+            logger.info(f"[animation] status={status} progress={progress}")
+
+            if status == "SUCCEEDED":
+                return task
+            if status in ("FAILED", "CANCELED"):
+                err = (task.get("task_error") or {}).get("message")
+                raise RuntimeError(f"Animating failed: {err or task}")
+
+            if time.time() - start > timeout_s:
+                raise TimeoutError(f"Animating timed out after {timeout_s}s: {task_id}")
 
             time.sleep(poll_s)
 
     @staticmethod
-    def _upload_avatar_to_storage_safe(glb_url: str, avatar_id: str, avatar_type: str, 
-                                      avatar_result: Dict[str, Any]) -> bool:
+    def _upload_avatar_to_storage_safe(glb_url: str, avatar_id: str, user_id: str, version: str,
+                                      avatar_result: Dict[str, Any], storage_key: str = "storage_glb_url") -> bool:
         """
         Safely upload avatar GLB to Firebase Storage and update result.
         
+        Args:
+            glb_url: URL of the GLB file to upload
+            avatar_id: Avatar ID
+            user_id: User ID for folder structure
+            version: Version identifier ("regular", "rigged", "idle", "walking")
+            avatar_result: Result dictionary to update with storage URL
+            storage_key: Key to store the storage URL in avatar_result
+            
         Returns:
             True if upload successful, False otherwise
         """
         try:
             if not glb_url:
-                logger.warning(f"[{avatar_id}] No GLB URL for {avatar_type} avatar")
+                logger.warning(f"[{avatar_id}] No GLB URL for {version} avatar")
+                return False
+            
+            if not user_id:
+                logger.warning(f"[{avatar_id}] No user_id provided, cannot upload {version} GLB")
                 return False
             
             storage_url = MediaGenerationService._save_avatar_to_storage(
                 glb_url=glb_url,
                 avatar_id=avatar_id,
-                avatar_type=avatar_type
+                user_id=user_id,
+                version=version
             )
             
             if storage_url:
-                avatar_result["storage_glb_url"] = storage_url
+                avatar_result[storage_key] = storage_url
                 return True
             return False
         except Exception as e:
-            logger.error(f"[{avatar_id}] Error uploading {avatar_type} GLB: {e}")
+            logger.error(f"[{avatar_id}] Error uploading {version} GLB: {e}")
             return False
+
+    @staticmethod
+    def _upload_all_avatar_versions(avatar_result: Dict[str, Any], avatar_id: str, user_id: str,
+                                    urls: Dict[str, Any], task_rigging: Optional[Dict[str, Any]] = None,
+                                    task_animation: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Upload all avatar versions (regular, rigged, idle, walking) to Firebase Storage.
+        
+        Args:
+            avatar_result: Avatar result dictionary to update with storage URLs
+            avatar_id: Avatar ID
+            user_id: User ID for folder structure
+            urls: URLs from refine task (contains regular/unrigged GLB)
+            task_rigging: Rigging task result (contains rigged GLB, may include walking animation)
+            task_animation: Animation task result (contains idle animation GLB with action_id 243)
+            
+        Returns:
+            Dictionary with storage URLs for all versions
+        """
+        storage_urls = {}
+        
+        if not user_id:
+            logger.warning(f"[{avatar_id}] No user_id provided, skipping storage uploads")
+            return storage_urls
+        
+        # 1. Upload regular (unrigged) avatar
+        regular_glb = urls.get("glb")
+        if regular_glb:
+            if MediaGenerationService._upload_avatar_to_storage_safe(
+                glb_url=regular_glb,
+                avatar_id=avatar_id,
+                user_id=user_id,
+                version="regular",
+                avatar_result=storage_urls,
+                storage_key="storage_regular_glb_url"
+            ):
+                logger.info(f"[{avatar_id}] ✅ Uploaded regular avatar to storage")
+        
+        # 2. Upload rigged avatar (if available)
+        if task_rigging:
+            rigged_urls = task_rigging.get("model_urls") or {}
+            rigged_glb = rigged_urls.get("glb")
+            if rigged_glb:
+                if MediaGenerationService._upload_avatar_to_storage_safe(
+                    glb_url=rigged_glb,
+                    avatar_id=avatar_id,
+                    user_id=user_id,
+                    version="rigged",
+                    avatar_result=storage_urls,
+                    storage_key="storage_rigged_glb_url"
+                ):
+                    logger.info(f"[{avatar_id}] ✅ Uploaded rigged avatar to storage")
+                    
+                    # 3. Walking animation: Upload rigged GLB as walking version
+                    # The rigged model from Meshy typically includes a default walking animation
+                    if MediaGenerationService._upload_avatar_to_storage_safe(
+                        glb_url=rigged_glb,
+                        avatar_id=avatar_id,
+                        user_id=user_id,
+                        version="walking",
+                        avatar_result=storage_urls,
+                        storage_key="storage_walking_glb_url"
+                    ):
+                        logger.info(f"[{avatar_id}] ✅ Uploaded walking animation avatar to storage")
+        
+        # 4. Upload idle animation avatar (if available)
+        if task_animation:
+            animated_urls = task_animation.get("model_urls") or {}
+            idle_glb = animated_urls.get("glb")
+            if idle_glb:
+                if MediaGenerationService._upload_avatar_to_storage_safe(
+                    glb_url=idle_glb,
+                    avatar_id=avatar_id,
+                    user_id=user_id,
+                    version="idle",
+                    avatar_result=storage_urls,
+                    storage_key="storage_idle_glb_url"
+                ):
+                    logger.info(f"[{avatar_id}] ✅ Uploaded idle animation avatar to storage")
+        
+        # Update avatar_result with all storage URLs
+        avatar_result.update(storage_urls)
+        
+        # Set primary storage_glb_url (prefer idle > rigged > regular)
+        avatar_result["storage_glb_url"] = (
+            storage_urls.get("storage_idle_glb_url") or 
+            storage_urls.get("storage_rigged_glb_url") or 
+            storage_urls.get("storage_regular_glb_url")
+        )
+        
+        return storage_urls
 
     @staticmethod
     def _generate_3d_avatar_sync(avatar_id: str, user_text: str, spec: AvatarSpec, 
@@ -751,13 +1030,18 @@ class MediaGenerationService:
             logger.info(f"[{avatar_id}] Generating clothed avatar...")
             
             try:
+                # Check if avatar is humanoid (only humanoid avatars get rigging and animation)
+                is_humanoid = spec.species == "human"
+                
                 clothed_result, clothed_retry_count = MediaGenerationService._generate_single_avatar_with_retry(
                     prompt=clothed_prompt,
                     avatar_type="clothed",
                     avatar_id=avatar_id,
                     art_style=art_style,
                     ai_model=ai_model,
-                    max_retries=3
+                    max_retries=3,
+                    is_humanoid=is_humanoid,
+                    user_id=user_id
                 )
                 
                 if clothed_result:
@@ -766,6 +1050,7 @@ class MediaGenerationService:
                     results["retry_info"]["clothed_retries"] = clothed_retry_count
                     
                     # Save clothed avatar immediately
+                    # Note: All GLB versions are already uploaded in _generate_single_avatar
                     MediaGenerationService._update_progress(
                         avatar_id, "clothed_complete", 80,
                         "Avatar generated successfully",
@@ -774,18 +1059,6 @@ class MediaGenerationService:
                             "retry_info": results["retry_info"]
                         }
                     )
-                    
-                    # Upload clothed GLB immediately
-                    clothed_glb_url = clothed_result.get("model_glb")
-                    if clothed_glb_url:
-                        MediaGenerationService._update_progress(
-                            avatar_id, "uploading_clothed", 85,
-                            "Uploading avatar GLB..."
-                        )
-                        MediaGenerationService._upload_avatar_to_storage_safe(
-                            clothed_glb_url, avatar_id, "clothed", clothed_result
-                        )
-                        results["clothed_avatar"] = clothed_result
                     
                     # Save progress to database
                     MediaGenerationService._save_avatar_to_database(
@@ -983,10 +1256,35 @@ class MediaGenerationService:
                 }
 
     @staticmethod
+    def _get_storage_path(user_id: str, avatar_id: str, version: str, storage_url: Optional[str] = None) -> Optional[str]:
+        """
+        Get Firebase Storage path for an avatar version.
+        Constructs path directly from known structure, or extracts from URL if provided.
+        
+        Args:
+            user_id: User ID
+            avatar_id: Avatar ID
+            version: Version name ("regular", "rigged", "idle", "walking")
+            storage_url: Optional Firebase Storage URL (used to verify file exists)
+            
+        Returns:
+            Storage path string (e.g., "avatars/{user_id}/{avatar_id}/regular_avatar.glb") or None
+        """
+        if not user_id or not avatar_id:
+            return None
+        
+        # Construct path directly from known structure
+        # Only return path if we have a storage URL (indicating file was uploaded)
+        if storage_url:
+            return f"avatars/{user_id}/{avatar_id}/{version}_avatar.glb"
+        
+        return None
+
+    @staticmethod
     def _save_avatar_to_database(avatar_spec: AvatarSpec, avatar_data: Dict[str, Any], 
                                  user_id: Optional[str] = None) -> str:
         """
-        Save avatar information to Firebase Firestore.
+        Save avatar information to Firebase Firestore with standardized fields.
         
         Args:
             avatar_spec: The AvatarSpec object with extracted information
@@ -997,6 +1295,49 @@ class MediaGenerationService:
             Document ID of the saved avatar
         """
         try:
+            # Get avatar_id
+            avatar_id = avatar_data.get("avatar_id")
+            if not avatar_id:
+                avatar_id = str(uuid.uuid4())
+            
+            # Get clothed_avatar data which contains storage URLs
+            clothed_avatar = avatar_data.get("clothed_avatar", {}) or {}
+            
+            # Extract storage URLs
+            storage_regular_url = clothed_avatar.get("storage_regular_glb_url")
+            storage_rigged_url = clothed_avatar.get("storage_rigged_glb_url")
+            storage_idle_url = clothed_avatar.get("storage_idle_glb_url")
+            storage_walking_url = clothed_avatar.get("storage_walking_glb_url")
+            
+            # Convert storage URLs to storage paths (only if URLs exist)
+            glb_path = MediaGenerationService._get_storage_path(
+                user_id or "", avatar_id, "regular", storage_regular_url
+            )
+            rigged_glb_path = MediaGenerationService._get_storage_path(
+                user_id or "", avatar_id, "rigged", storage_rigged_url
+            )
+            idle_glb_path = MediaGenerationService._get_storage_path(
+                user_id or "", avatar_id, "idle", storage_idle_url
+            )
+            walking_glb_path = MediaGenerationService._get_storage_path(
+                user_id or "", avatar_id, "walking", storage_walking_url
+            )
+            
+            # Determine if humanoid
+            is_humanoid = avatar_spec.species == "human" if avatar_spec else False
+            
+            # Prepare document data with standardized fields
+            avatar_doc = {
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "glbPath": glb_path or "",  # Regular/unrigged GLB path
+                "idleGlbPath": idle_glb_path or "",  # Idle animation GLB path
+                "isHumanoid": is_humanoid,  # Boolean
+                "riggedGlbPath": rigged_glb_path or "",  # Rigged GLB path
+                "userId": user_id or "",  # String
+                "walkingGlbPath": walking_glb_path or "",  # Walking animation GLB path
+            }
+            
+            # Also keep legacy fields for backward compatibility
             # Convert spec to dict if needed
             try:
                 spec_dict = avatar_spec.model_dump()
@@ -1006,29 +1347,22 @@ class MediaGenerationService:
                     spec_dict = asdict(avatar_spec)
                 except Exception:
                     spec_dict = avatar_spec.dict() if hasattr(avatar_spec, 'dict') else dict(avatar_spec)
-
-            # Prepare document data
-            avatar_doc = {
-                "avatar_id": avatar_data.get("avatar_id"),
+            
+            avatar_doc.update({
+                "avatar_id": avatar_id,
                 "user_id": user_id,
                 "user_prompt": avatar_data.get("user_prompt"),
                 "clothed_prompt": avatar_data.get("clothed_prompt"),
                 "spec": spec_dict,
-                "clothed_avatar": avatar_data.get("clothed_avatar"),
+                "clothed_avatar": clothed_avatar,
                 "status": avatar_data.get("status", "processing"),
                 "created_at": firestore.SERVER_TIMESTAMP,
                 "updated_at": firestore.SERVER_TIMESTAMP
-            }
+            })
 
             # Add error if present
             if "error" in avatar_data:
                 avatar_doc["error"] = avatar_data["error"]
-
-            # Save to Firestore
-            avatar_id = avatar_data.get("avatar_id")
-            if not avatar_id:
-                avatar_id = str(uuid.uuid4())
-                avatar_doc["avatar_id"] = avatar_id
 
             # Save to 'avatars' collection
             db.collection('avatars').document(avatar_id).set(avatar_doc, merge=True)
@@ -1051,14 +1385,16 @@ class MediaGenerationService:
             raise
 
     @staticmethod
-    def _save_avatar_to_storage(glb_url: str, avatar_id: str, avatar_type: str) -> Optional[str]:
+    def _save_avatar_to_storage(glb_url: str, avatar_id: str, user_id: str, version: str) -> Optional[str]:
         """
         Download GLB file from Meshy URL and upload to Firebase Storage.
+        Creates folder structure: avatars/{user_id}/{avatar_id}/
         
         Args:
             glb_url: URL of the GLB file from Meshy
             avatar_id: Unique avatar ID
-            avatar_type: "clothed" (avatar type identifier)
+            user_id: User ID for folder organization
+            version: Version identifier ("regular", "rigged", "idle", "walking")
             
         Returns:
             Public URL of the uploaded file, or None if upload fails
@@ -1068,24 +1404,29 @@ class MediaGenerationService:
                 logger.warning("GLB URL or storage not available, skipping storage upload")
                 return None
 
+            if not user_id:
+                logger.warning(f"[{avatar_id}] No user_id provided, cannot create folder structure")
+                return None
+
             # Download GLB file from Meshy
-            logger.info(f"Downloading {avatar_type} GLB from Meshy...")
+            logger.info(f"Downloading {version} GLB from Meshy for avatar {avatar_id}...")
             response = requests.get(glb_url, timeout=60)
             response.raise_for_status()
 
-            # Upload to Firebase Storage
-            blob_name = f"avatars/{avatar_id}/{avatar_type}_avatar.glb"
+            # Upload to Firebase Storage with hierarchical structure
+            # Structure: avatars/{user_id}/{avatar_id}/{version}_avatar.glb
+            blob_name = f"avatars/{user_id}/{avatar_id}/{version}_avatar.glb"
             bucket = storage.bucket()
             blob = bucket.blob(blob_name)
             blob.upload_from_string(response.content, content_type='model/gltf-binary')
             blob.make_public()
             
             public_url = blob.public_url
-            logger.info(f"✅ Uploaded {avatar_type} GLB to Firebase Storage: {public_url}")
+            logger.info(f"✅ Uploaded {version} GLB to Firebase Storage: {public_url}")
             return public_url
 
         except Exception as e:
-            logger.error(f"❌ Error uploading {avatar_type} GLB to storage: {e}")
+            logger.error(f"❌ Error uploading {version} GLB to storage: {e}")
             # Don't fail the entire process if storage upload fails
             return None
 
@@ -1116,6 +1457,106 @@ class MediaGenerationService:
             return None
         except Exception as e:
             logger.error(f"Error retrieving avatar {avatar_id}: {e}")
+            return None
+
+    @staticmethod
+    def generate_signed_url(storage_path: str, expiration_minutes: int = 60) -> Optional[str]:
+        """
+        Generate a signed URL for a Firebase Storage file.
+        
+        Args:
+            storage_path: Path to the file in Firebase Storage (e.g., "avatars/user123/avatar456/regular_avatar.glb")
+            expiration_minutes: URL expiration time in minutes (default: 60 minutes)
+            
+        Returns:
+            Signed URL string or None if generation fails
+        """
+        try:
+            if not storage_path or not storage_path.strip():
+                logger.warning(f"Empty storage path provided for signed URL generation")
+                return None
+            
+            if not storage:
+                logger.warning("Firebase Storage not available")
+                return None
+            
+            bucket = storage.bucket()
+            blob = bucket.blob(storage_path)
+            
+            # Generate signed URL
+            # Note: If blob doesn't exist, this will still generate a URL but it won't work when accessed
+            expiration = timedelta(minutes=expiration_minutes)
+            signed_url = blob.generate_signed_url(
+                expiration=expiration,
+                method='GET',
+                version='v4'
+            )
+            
+            logger.info(f"✅ Generated signed URL for {storage_path} (expires in {expiration_minutes} minutes)")
+            return signed_url
+            
+        except Exception as e:
+            logger.error(f"❌ Error generating signed URL for {storage_path}: {e}")
+            return None
+
+    @staticmethod
+    def get_avatar_signed_urls(avatar_id: str, expiration_minutes: int = 60) -> Optional[Dict[str, Any]]:
+        """
+        Get signed URLs for all avatar GLB files for Unity loading.
+        
+        Args:
+            avatar_id: Avatar ID
+            expiration_minutes: URL expiration time in minutes (default: 60 minutes)
+            
+        Returns:
+            Dictionary with signed URLs for all avatar versions, or None if avatar not found
+        """
+        try:
+            avatar_data = MediaGenerationService.get_avatar_by_id(avatar_id)
+            if not avatar_data:
+                return None
+            
+            # Extract storage paths from database
+            glb_path = avatar_data.get("glbPath", "")
+            rigged_glb_path = avatar_data.get("riggedGlbPath", "")
+            idle_glb_path = avatar_data.get("idleGlbPath", "")
+            walking_glb_path = avatar_data.get("walkingGlbPath", "")
+            
+            # Generate signed URLs for all available paths
+            signed_urls = {}
+            
+            if glb_path:
+                signed_url = MediaGenerationService.generate_signed_url(glb_path, expiration_minutes)
+                if signed_url:
+                    signed_urls["glbUrl"] = signed_url
+            
+            if rigged_glb_path:
+                signed_url = MediaGenerationService.generate_signed_url(rigged_glb_path, expiration_minutes)
+                if signed_url:
+                    signed_urls["riggedGlbUrl"] = signed_url
+            
+            if idle_glb_path:
+                signed_url = MediaGenerationService.generate_signed_url(idle_glb_path, expiration_minutes)
+                if signed_url:
+                    signed_urls["idleGlbUrl"] = signed_url
+            
+            if walking_glb_path:
+                signed_url = MediaGenerationService.generate_signed_url(walking_glb_path, expiration_minutes)
+                if signed_url:
+                    signed_urls["walkingGlbUrl"] = signed_url
+            
+            # Return response with metadata
+            return {
+                "avatar_id": avatar_id,
+                "isHumanoid": avatar_data.get("isHumanoid", False),
+                "userId": avatar_data.get("userId", ""),
+                "createdAt": avatar_data.get("createdAt"),
+                "signedUrls": signed_urls,
+                "expiresInMinutes": expiration_minutes
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting signed URLs for avatar {avatar_id}: {e}")
             return None
 
     @staticmethod
