@@ -7,6 +7,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Import preference service for checking user preferences
+from services.notifications.preference_service import NotificationPreferenceService
+from services.notifications.queue_service import NotificationQueueService
+
 
 class NotificationPushService:
     """Service for FCM push notifications"""
@@ -72,6 +76,53 @@ class NotificationPushService:
             notification_data = data.get('data', {})
 
             logger.info(f"Sending push notification to user {user_id}: {title}")
+
+            # ===== CHECK IF USER IS SENDING TO THEMSELVES =====
+            # Prevent users from receiving push notifications for their own actions
+            sender_id = notification_data.get('senderId')
+            if sender_id and sender_id == user_id:
+                logger.info(f"❌ Skipping push notification - user {user_id} is the sender")
+                return jsonify({
+                    "success": True, 
+                    "message": "Notification skipped - sender cannot receive push for own message",
+                    "skipped": True,
+                    "reason": "self-notification"
+                }), 200
+            
+            # ===== CHECK USER PREFERENCES BEFORE SENDING =====
+            # Extract notification type from data payload
+            notif_type = notification_data.get('type', 'system')
+            actor_id = notification_data.get('senderId') or notification_data.get('followerId') or notification_data.get('userId')
+            
+            logger.info(f"Checking preferences for notification type: {notif_type}, actor: {actor_id}")
+            
+            # Check if notifications should be sent based on user preferences
+            should_send = NotificationPreferenceService.should_send_notification(
+                user_id, 
+                notif_type, 
+                actor_id
+            )
+            
+            if not should_send:
+                logger.info(f"❌ Notification blocked by user preferences (pauseAll or category settings)")
+                return jsonify({
+                    "success": True, 
+                    "message": "Notification blocked by user preferences",
+                    "blocked": True
+                }), 200
+            
+            # Check if user is in quiet hours or has pauseAll enabled
+            is_quiet, quiet_reason = NotificationQueueService.is_user_in_quiet_state(user_id)
+            if is_quiet:
+                logger.info(f"⏰ User is in quiet state ({quiet_reason}), push notification blocked for digest")
+                return jsonify({
+                    "success": True, 
+                    "message": f"User in quiet state ({quiet_reason}), push notification blocked",
+                    "blocked": True,
+                    "reason": quiet_reason
+                }), 200
+
+            logger.info(f"✅ Preferences check passed, proceeding to send notification")
 
             # Get user's FCM tokens - check humanUsers first
             user_tokens = []
