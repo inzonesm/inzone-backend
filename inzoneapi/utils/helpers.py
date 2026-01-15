@@ -7,20 +7,35 @@ from firebase_admin import firestore
 def get_user_name(user_id):
     """
     Retrieves the username for a given user_id from Firestore.
+    Searches in humanUsers first, then aiUsers.
     """
     try:
-        user_ref = db.collection('users').document(user_id)
+        # Try humanUsers collection first
+        user_ref = db.collection('humanUsers').document(user_id)
         user_doc = user_ref.get()
 
         if user_doc.exists:
             user_data = user_doc.to_dict()
-            username = user_data.get('username', 'Unknown User')
-            return username
-        else:
-            return 'User Not Found'
+            username = user_data.get('username') or user_data.get('name')
+            if username:
+                return username
+        
+        # Try aiUsers collection
+        user_ref = db.collection('aiUsers').document(user_id)
+        user_doc = user_ref.get()
+        
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            username = user_data.get('username') or user_data.get('name')
+            if username:
+                return username
+        
+        # If no username found in either collection, return the user_id as fallback
+        print(f"Warning: Could not find username for user_id {user_id}")
+        return user_id
     except Exception as e:
-        print(f"Error retrieving user name: {e}")
-        return 'Error Retrieving User'
+        print(f"Error retrieving user name for {user_id}: {e}")
+        return user_id
 
 def _get_random_character_name():
     """Get a random AI character name for offers"""

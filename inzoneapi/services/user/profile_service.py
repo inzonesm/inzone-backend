@@ -580,8 +580,21 @@ class ProfileService:
                 new_following = []
                 for entry in current_following:
                     if isinstance(entry, str):
-                        new_following.append({"id": entry, "username": following_username, "type": "human" if follower_collection == "humanUsers" else "ai"})
+                        # Fetch the actual username for this user ID
+                        entry_username = get_user_name(entry)
+                        # Determine type by checking which collection the user is in
+                        entry_type = "human"
+                        try:
+                            if not db.collection('humanUsers').document(entry).get().exists:
+                                if db.collection('aiUsers').document(entry).get().exists:
+                                    entry_type = "ai"
+                        except:
+                            pass
+                        new_following.append({"id": entry, "username": entry_username, "type": entry_type})
                     else:
+                        # Ensure existing entries have usernames
+                        if not entry.get("username"):
+                            entry["username"] = get_user_name(entry.get("id", ""))
                         new_following.append(entry)
                 
                 new_following.append(following_entry)
@@ -614,8 +627,21 @@ class ProfileService:
                 new_followers = []
                 for entry in current_followers:
                     if isinstance(entry, str):
-                        new_followers.append({"id": entry, "type": "human" if following_collection == "humanUsers" else "ai"})
+                        # Fetch the actual username for this user ID
+                        entry_username = get_user_name(entry)
+                        # Determine type by checking which collection the user is in
+                        entry_type = "human"
+                        try:
+                            if not db.collection('humanUsers').document(entry).get().exists:
+                                if db.collection('aiUsers').document(entry).get().exists:
+                                    entry_type = "ai"
+                        except:
+                            pass
+                        new_followers.append({"id": entry, "username": entry_username, "type": entry_type})
                     else:
+                        # Ensure existing entries have usernames
+                        if not entry.get("username"):
+                            entry["username"] = get_user_name(entry.get("id", ""))
                         new_followers.append(entry)
                 
                 new_followers.append(follower_entry)
@@ -627,68 +653,18 @@ class ProfileService:
                 # Create notification for the user being followed (only for human users)
                 if following_type == "human":
                     try:
-                        # Get the actual follower name from the database if not provided
-                        actual_follower_name = follower_username
-                        if not actual_follower_name or actual_follower_name == 'None':
-                            actual_follower_name = get_user_name(follower_id)
+                        # Use the notification event service to handle notifications properly
+                        # This respects quiet hours, user preferences, and digest system
+                        from services.notifications.event_service import NotificationEventService
                         
-                        notification_data = {
-                            'userId': following_id,
-                            'type': 'follow',
-                            'title': 'New Follower',
-                            'body': f'{actual_follower_name} started following you',
-                            'isRead': False,
-                            'createdAt': firestore.SERVER_TIMESTAMP,
-                            'data': {
-                                'followerId': follower_id,
-                                'followerUsername': actual_follower_name,
-                                'followerType': follower_type
-                            },
-                            # deeplink removed per repository-wide deprecation of in-app deeplinks
+                        notification_event_data = {
+                            'followerId': follower_id,
+                            'followedUserId': following_id,
+                            'timestamp': datetime.utcnow().isoformat()
                         }
                         
-                        db.collection('notifications').add(notification_data)
-                        logger.info(f"Follow notification created for user {following_id}")
-                        
-                        # Also send push notification
-                        try:
-                            # Get followed user's FCM tokens
-                            user_doc = db.collection('humanUsers').document(following_id).get()
-                            if user_doc.exists:
-                                user_data = user_doc.to_dict()
-                                user_tokens = user_data.get('fcmTokens', [])
-                                
-                                if user_tokens:
-                                    # Send FCM notifications to all user's devices
-                                    for token in user_tokens:
-                                        try:
-                                            message = messaging.Message(
-                                                notification=messaging.Notification(
-                                                    title='New Follower',
-                                                    body=f'{actual_follower_name} started following you'
-                                                ),
-                                                data={
-                                                    'type': 'user_follow',
-                                                    'followerId': follower_id,
-                                                    'followerUsername': actual_follower_name,
-                                                    'action': 'navigate_to_profile',
-                                                    'route': f'/profile/{follower_id}',
-                                                },
-                                                token=token
-                                            )
-                                            
-                                            response = messaging.send(message)
-                                            logger.info(f"Follow push notification sent to token {token[:20]}...")
-                                            
-                                        except Exception as token_error:
-                                            logger.error(f"Failed to send follow push notification to token {token[:20]}...: {token_error}")
-                                else:
-                                    logger.info(f"No FCM tokens found for followed user {following_id}")
-                            else:
-                                logger.warning(f"Followed user {following_id} not found in humanUsers collection")
-                                
-                        except Exception as push_error:
-                            logger.error(f"Error sending follow push notification: {push_error}")
+                        result, status_code = NotificationEventService.handle_user_follow(notification_event_data)
+                        logger.info(f"Follow notification event handled with status {status_code}")
                         
                     except Exception as e:
                         logger.error(f"Error creating follow notification: {e}")

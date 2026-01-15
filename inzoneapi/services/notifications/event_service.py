@@ -4,6 +4,7 @@ from google.cloud import firestore
 from firebase_admin import messaging
 from dependencies import db
 from services.notifications.queue_service import NotificationQueueService
+from services.notifications.preference_service import NotificationPreferenceService
 import logging
 import random
 
@@ -50,52 +51,71 @@ class NotificationEventService:
                 if not participant_id or participant_id == data['senderId']:
                     continue
 
-                # Check if user has group notifications enabled
-                user_doc = db.collection('humanUsers').document(participant_id).get()
-                if user_doc.exists:
-                    user_data = user_doc.to_dict()
-                    prefs = user_data.get('notificationPrefs', {})
-                    categories = prefs.get('categories', {})
-                    group_prefs = categories.get('group', {'enabled': True})
+                # ALWAYS save to Firestore - get user preferences only for filtering UI display
+                # Get user preferences to check notification filtering
+                user_prefs = NotificationPreferenceService.get_user_preferences(participant_id)
+                categories = user_prefs.get('categories', {})
+                group_prefs = categories.get('group', {'enabled': True, 'notifyFor': 'everyone'})
+                
+                notify_for = group_prefs.get('notifyFor', 'everyone')
+                
+                # Check if user is in quiet/paused state
+                is_quiet, quiet_reason = NotificationQueueService.is_user_in_quiet_state(participant_id)
+                
+                # ALWAYS create notification document for notification center
+                notification_doc = {
+                    'userId': participant_id,
+                    'type': 'group_message',
+                    'title': f"New message in {group_data.get('name', 'Group Chat')}",
+                    'body': f"{NotificationQueueService.get_user_name(data['senderId'])}: {data['content'][:50]}...",
+                    'isRead': False,
+                    'createdAt': firestore.SERVER_TIMESTAMP,
+                    'data': {
+                        'groupId': data['groupId'],
+                        'groupName': group_data.get('name', 'Group Chat'),
+                        'senderId': data['senderId'],
+                        'senderName': NotificationQueueService.get_user_name(data['senderId']),
+                        'messageContent': data['content']
+                    }
+                }
+                
+                # Add quietDigest flag if in quiet state
+                if is_quiet:
+                    notification_doc['quietDigest'] = True
 
-                    if group_prefs.get('enabled', True):
-                        # Create notification document
-                        notification_doc = {
-                            'userId': participant_id,
-                            'type': 'group_message',
-                            'title': f"New message in {group_data.get('name', 'Group Chat')}",
-                            'body': f"{NotificationQueueService.get_user_name(data['senderId'])}: {data['content'][:50]}...",
-                            'isRead': False,
-                            'createdAt': firestore.SERVER_TIMESTAMP,
-                            'data': {
-                                'groupId': data['groupId'],
-                                'groupName': group_data.get('name', 'Group Chat'),
-                                'senderId': data['senderId'],
-                                'senderName': NotificationQueueService.get_user_name(data['senderId']),
-                                'messageContent': data['content']
-                            }
-                        }
+                # Store notification in Firestore
+                db.collection('notifications').add(notification_doc)
+                
+                # ALWAYS trigger auto-check for digest
+                NotificationQueueService._auto_check_user_digest(participant_id)
 
-                        # Store notification in Firestore
-                        db.collection('notifications').add(notification_doc)
+                # Only queue for push if user is NOT in quiet state
+                if not is_quiet:
+                    # Get batch time preference (default to 15 if not set)
+                    batch_mins = group_prefs.get('batchMins', 15)
 
-                        # Also queue for FCM push notification
-                        notification_data = {
-                            'type': 'group_digest',
-                            'userId': participant_id,
-                            'groupId': data['groupId'],
-                            'groupName': group_data.get('name', 'Group Chat'),
-                            'senderName': NotificationQueueService.get_user_name(data['senderId']),
-                            'content': data['content'][:100],
-                            'timestamp': data['timestamp']
-                        }
-                        NotificationQueueService.queue_notification(notification_data, batch=True, delay_minutes=5)
-                        notifications_created += 1
+                    # Queue for FCM push notification
+                    notification_data = {
+                        'type': 'group_digest',
+                        'userId': participant_id,
+                        'groupId': data['groupId'],
+                        'groupName': group_data.get('name', 'Group Chat'),
+                        'senderName': NotificationQueueService.get_user_name(data['senderId']),
+                        'content': data['content'][:100],
+                        'timestamp': data['timestamp']
+                    }
+                    NotificationQueueService.smart_queue_notification(notification_data, batch=True, delay_minutes=batch_mins)
+                else:
+                    logger.info(f"User {participant_id} in quiet state ({quiet_reason}), notification saved for digest only")
+                    
+                notifications_created += 1
 
+            # Return info about which participants are in quiet state
             return jsonify({
                 "success": True,
                 "message": "Group message notifications created and queued",
-                "notifications_created": notifications_created
+                "notifications_created": notifications_created,
+                "skipPushNotifications": True  # Backend handles push via queue
             }), 200
 
         except Exception as e:
@@ -131,7 +151,7 @@ class NotificationEventService:
             }
 
             # Queue high-priority notification
-            NotificationQueueService.queue_notification(notification_data, immediate=True)
+            NotificationQueueService.smart_queue_notification(notification_data, immediate=True)
 
             return jsonify({"success": True, "message": "Mention notification queued"}), 200
 
@@ -148,35 +168,68 @@ class NotificationEventService:
             if not all(field in data for field in required_fields):
                 return jsonify({"success": False, "error": "Missing required fields"}), 400
 
-            # Check if receiver has DM notifications enabled
-            user_doc = db.collection('humanUsers').document(data['receiverId']).get()
-            if user_doc.exists:
-                user_data = user_doc.to_dict()
-                prefs = user_data.get('notificationPrefs', {})
-                categories = prefs.get('categories', {})
-                dm_prefs = categories.get('dm', {'enabled': True})
+            # Validate that receiverId is a Firebase UID (not a username)
+            receiver_id = data['receiverId']
+            if ' ' in receiver_id or len(receiver_id) < 10:
+                logger.warning(f"Rejected invalid receiverId (likely username): '{receiver_id}'")
+                return jsonify({
+                    "success": False, 
+                    "error": f"Invalid receiverId: appears to be a username, not a Firebase UID. Received: '{receiver_id}'"
+                }), 400
 
-                if dm_prefs.get('enabled', True):
-                    # Store notification directly in notifications collection
-                    notification_doc = {
-                        'userId': data['receiverId'],
-                        'type': 'direct_message',
-                        'title': NotificationQueueService.get_user_name(data['senderId']),
-                        'body': data['content'][:100] + '...' if len(data['content']) > 100 else data['content'],
-                        'isRead': False,
-                        'createdAt': firestore.SERVER_TIMESTAMP,
-                        'data': {
-                            'chatId': data['chatId'],
-                            'senderId': data['senderId'],
-                            'senderName': NotificationQueueService.get_user_name(data['senderId']),
-                            'messageContent': data['content']
-                        }
-                    }
+            # Get DM preferences for additional settings
+            user_prefs = NotificationPreferenceService.get_user_preferences(data['receiverId'])
+            categories = user_prefs.get('categories', {})
+            dm_prefs = categories.get('dm', {'enabled': True, 'showPreviews': True})
 
-                    # Store in main notifications collection
-                    db.collection('notifications').add(notification_doc)
+            # Determine message body based on preview preference
+            show_previews = dm_prefs.get('showPreviews', True)
+            if show_previews:
+                message_body = data['content'][:100] + '...' if len(data['content']) > 100 else data['content']
+            else:
+                message_body = 'You have a new message'
 
-            return jsonify({"success": True, "message": "DM notification created"}), 200
+            # Check if user is in quiet/paused state
+            is_quiet, quiet_reason = NotificationQueueService.is_user_in_quiet_state(data['receiverId'])
+
+            # ALWAYS save notification to Firestore notifications collection (for notification center)
+            notification_doc = {
+                'userId': data['receiverId'],
+                'type': 'direct_message',
+                'title': NotificationQueueService.get_user_name(data['senderId']),
+                'body': message_body,
+                'isRead': False,
+                'createdAt': firestore.SERVER_TIMESTAMP,
+                'data': {
+                    'chatId': data['chatId'],
+                    'senderId': data['senderId'],
+                    'senderName': NotificationQueueService.get_user_name(data['senderId']),
+                    'messageContent': data['content'] if show_previews else ''
+                }
+            }
+            
+            # Add quietDigest flag if in quiet state
+            if is_quiet:
+                notification_doc['quietDigest'] = True
+
+            # Store in main notifications collection (always saved regardless of preferences)
+            db.collection('notifications').add(notification_doc)
+            
+            # ALWAYS trigger auto-check for digest, even during quiet hours
+            # This ensures digest gets sent when quiet hours naturally end
+            NotificationQueueService._auto_check_user_digest(data['receiverId'])
+
+            # Return whether push notification should be sent
+            # If user is in quiet state, tell Flutter NOT to send push
+            response_data = {
+                "success": True, 
+                "message": "DM notification created",
+                "shouldPush": not is_quiet,  # Only push if NOT in quiet state
+                "inQuietState": is_quiet,
+                "quietReason": quiet_reason if is_quiet else None
+            }
+
+            return jsonify(response_data), 200
 
         except Exception as e:
             logger.error(f"Error handling DM notification: {e}")
@@ -196,68 +249,95 @@ class NotificationEventService:
             if not post_author_id or post_author_id == data['userId']:
                 return jsonify({"success": True, "message": "No notification needed"}), 200
 
-            # Check if post author has engagement notifications enabled
-            user_doc = db.collection('humanUsers').document(post_author_id).get()
-            if user_doc.exists:
-                user_data = user_doc.to_dict()
-                prefs = user_data.get('notificationPrefs', {})
-                categories = prefs.get('categories', {})
-                engagement_prefs = categories.get('engagement', {'enabled': True})
+            # Validate that postAuthorId is a Firebase UID (not a username)
+            # Firebase UIDs are alphanumeric and typically 20-28 characters
+            # Usernames often contain spaces, special characters, or are shorter
+            if ' ' in post_author_id or len(post_author_id) < 10:
+                logger.warning(f"Rejected invalid postAuthorId (likely username): '{post_author_id}'")
+                return jsonify({
+                    "success": False, 
+                    "error": f"Invalid postAuthorId: appears to be a username, not a Firebase UID. Received: '{post_author_id}'"
+                }), 400
 
-                if engagement_prefs.get('enabled', True):
-                    # Create notification document
-                    engagement_types = {
-                        'like': 'liked',
-                        'comment': 'commented on',
-                        'share': 'shared'
-                    }
+            # Determine notification type based on engagement
+            engagement_type = data['type']
+            if engagement_type == 'like':
+                notif_type = 'like'
+            elif engagement_type == 'comment':
+                notif_type = 'comment'
+            else:
+                notif_type = 'like'  # Default to like for other types
 
-                    # Create proper notification type and title based on engagement type
-                    engagement_type = data['type']
-                    if engagement_type == 'like':
-                        notification_type = 'post_like'
-                        notification_title = f"{NotificationQueueService.get_user_name(data['userId'])} liked your post"
-                    elif engagement_type == 'comment':
-                        notification_type = 'post_comment'
-                        notification_title = f"{NotificationQueueService.get_user_name(data['userId'])} commented on your post"
-                    elif engagement_type == 'share':
-                        notification_type = 'post_share'
-                        notification_title = f"{NotificationQueueService.get_user_name(data['userId'])} shared your post"
-                    else:
-                        notification_type = 'post_engagement'
-                        notification_title = f"{NotificationQueueService.get_user_name(data['userId'])} engaged with your post"
+            # ALWAYS save to Firestore - preferences only checked for push
+            # Create proper notification type and title based on engagement type
+            engagement_types = {
+                'like': 'liked',
+                'comment': 'commented on',
+                'share': 'shared'
+            }
 
-                    notification_doc = {
-                        'userId': post_author_id,
-                        'type': notification_type,
-                        'title': notification_title,
-                        'body': f"{NotificationQueueService.get_user_name(data['userId'])} {engagement_types.get(data['type'], 'engaged with')} your post",
-                        'isRead': False,
-                        'createdAt': firestore.SERVER_TIMESTAMP,
-                        'data': {
-                            'postId': data['postId'],
-                            'engagementType': data['type'],
-                            'engagerUserId': data['userId'],
-                            'content': data.get('content', '')
-                        }
-                    }
+            if engagement_type == 'like':
+                notification_type = 'post_like'
+                notification_title = f"{NotificationQueueService.get_user_name(data['userId'])} liked your post"
+            elif engagement_type == 'comment':
+                notification_type = 'post_comment'
+                notification_title = f"{NotificationQueueService.get_user_name(data['userId'])} commented on your post"
+            elif engagement_type == 'share':
+                notification_type = 'post_share'
+                notification_title = f"{NotificationQueueService.get_user_name(data['userId'])} shared your post"
+            else:
+                notification_type = 'post_engagement'
+                notification_title = f"{NotificationQueueService.get_user_name(data['userId'])} engaged with your post"
 
-                    # Store notification in Firestore
-                    db.collection('notifications').add(notification_doc)
+            # Check if user is in quiet/paused state
+            is_quiet, quiet_reason = NotificationQueueService.is_user_in_quiet_state(post_author_id)
 
-                    # Also queue for FCM (batched)
-                    notification_data = {
-                        'type': 'engagement_digest',
-                        'userId': post_author_id,
-                        'postId': data['postId'],
-                        'engagementType': data['type'],
-                        'engagerUserId': data['userId'],
-                        'content': data.get('content', ''),
-                        'timestamp': data['timestamp']
-                    }
-                    NotificationQueueService.queue_notification(notification_data, batch=True, delay_minutes=30)
+            notification_doc = {
+                'userId': post_author_id,
+                'type': notification_type,
+                'title': notification_title,
+                'body': f"{NotificationQueueService.get_user_name(data['userId'])} {engagement_types.get(data['type'], 'engaged with')} your post",
+                'isRead': False,
+                'createdAt': firestore.SERVER_TIMESTAMP,
+                'data': {
+                    'postId': data['postId'],
+                    'engagementType': data['type'],
+                    'engagerUserId': data['userId'],
+                    'content': data.get('content', '')
+                }
+            }
+            
+            # Add quietDigest flag if in quiet state
+            if is_quiet:
+                notification_doc['quietDigest'] = True
 
-            return jsonify({"success": True, "message": "Engagement notification created and queued"}), 200
+            # Store notification in Firestore
+            db.collection('notifications').add(notification_doc)
+            
+            # ALWAYS trigger auto-check for digest
+            NotificationQueueService._auto_check_user_digest(post_author_id)
+
+            # Only queue for push if user is NOT in quiet state
+            if not is_quiet:
+                # Queue for FCM (batched) - use default 30 minutes
+                notification_data = {
+                    'type': 'engagement_digest',
+                    'userId': post_author_id,
+                    'postId': data['postId'],
+                    'engagementType': data['type'],
+                    'engagerUserId': data['userId'],
+                    'content': data.get('content', ''),
+                    'timestamp': data['timestamp']
+                }
+                NotificationQueueService.smart_queue_notification(notification_data, batch=True, delay_minutes=30)
+            else:
+                logger.info(f"User {post_author_id} in quiet state ({quiet_reason}), notification saved for digest only")
+
+            return jsonify({
+                "success": True, 
+                "message": "Engagement notification created and queued",
+                "skipPushNotifications": True  # Backend handles push via queue
+            }), 200
 
         except Exception as e:
             logger.error(f"Error handling engagement notification: {e}")
@@ -278,12 +358,68 @@ class NotificationEventService:
 
             follower_id = data['followerId']
             followed_user_id = data['followedUserId']
+            
+            # Validate that user IDs are Firebase UIDs (not usernames)
+            if ' ' in followed_user_id or len(followed_user_id) < 10:
+                logger.warning(f"Rejected invalid followedUserId (likely username): '{followed_user_id}'")
+                return jsonify({
+                    "success": False, 
+                    "error": f"Invalid followedUserId: appears to be a username, not a Firebase UID. Received: '{followed_user_id}'"
+                }), 400
+            if ' ' in follower_id or len(follower_id) < 10:
+                logger.warning(f"Rejected invalid followerId (likely username): '{follower_id}'")
+                return jsonify({
+                    "success": False, 
+                    "error": f"Invalid followerId: appears to be a username, not a Firebase UID. Received: '{follower_id}'"
+                }), 400
 
             logger.info(f"Processing follow notification: {follower_id} -> {followed_user_id}")
 
             # Get follower name
             follower_name = NotificationQueueService.get_user_name(follower_id)
             logger.info(f"Follower name resolved: {follower_name}")
+
+            # Check if user is in quiet/paused state
+            is_quiet, quiet_reason = NotificationQueueService.is_user_in_quiet_state(followed_user_id)
+
+            # ALWAYS save notification to Firestore for notification center
+            notification_doc = {
+                'userId': followed_user_id,
+                'type': 'user_follow',
+                'title': 'New Follower',
+                'body': f'{follower_name} started following you',
+                'isRead': False,
+                'createdAt': firestore.SERVER_TIMESTAMP,
+                'data': {
+                    'followerId': follower_id,
+                    'followerName': follower_name,
+                    'timestamp': data['timestamp']
+                }
+            }
+            
+            # Add quietDigest flag if in quiet state
+            if is_quiet:
+                notification_doc['quietDigest'] = True
+            db.collection('notifications').add(notification_doc)
+            logger.info(f"Follow notification saved to Firestore for user {followed_user_id}")
+            
+            # ALWAYS trigger auto-check for digest
+            NotificationQueueService._auto_check_user_digest(followed_user_id)
+
+            # If user is in quiet state, don't send push - save for digest
+            if is_quiet:
+                logger.info(f"User {followed_user_id} in quiet state ({quiet_reason}), push notification saved for digest")
+                return jsonify({
+                    "success": True, 
+                    "message": "Notification saved for digest",
+                    "inQuietState": True,
+                    "quietReason": quiet_reason
+                }), 200
+
+            # Check preferences before sending push notification
+            if not NotificationPreferenceService.should_send_notification(followed_user_id, 'follower'):
+                logger.info(f"Push notification blocked by preferences for user {followed_user_id}")
+                return jsonify({"success": True, "message": "Notification saved to Firestore, push blocked by preferences"}), 200
 
             # Get followed user's FCM tokens
             try:
@@ -363,19 +499,48 @@ class NotificationEventService:
                 'double_coins': f"Limited time: Double coins for {data['coinAmount']} minutes!"
             }
 
+            offer_text = offer_texts.get(data['offerType'], f"Earn {data['coinAmount']} InCash!")
+
+            # Check if user is in quiet/paused state
+            is_quiet, quiet_reason = NotificationQueueService.is_user_in_quiet_state(data['userId'])
+
+            # ALWAYS save notification to Firestore for notification center
+            notification_doc = {
+                'userId': data['userId'],
+                'type': 'rare_offer',
+                'title': f'{character_name} has a special offer!',
+                'body': offer_text,
+                'isRead': False,
+                'createdAt': firestore.SERVER_TIMESTAMP,
+                'data': {
+                    'characterName': character_name,
+                    'offerType': data['offerType'],
+                    'coinAmount': data['coinAmount'],
+                    'reason': data.get('reason', 'special_offer')
+                }
+            }
+            
+            # Add quietDigest flag if in quiet state
+            if is_quiet:
+                notification_doc['quietDigest'] = True
+            db.collection('notifications').add(notification_doc)
+
+            # Check preferences before sending push notification
+            if not NotificationPreferenceService.should_send_notification(data['userId'], 'rare_offer'):
+                return jsonify({"success": True, "message": "Notification saved to Firestore, push blocked by preferences"}), 200
+
+            # Queue high-priority push notification
             notification_data = {
                 'type': 'rare_offer',
                 'userId': data['userId'],
                 'characterName': character_name,
                 'offerType': data['offerType'],
-                'offerText': offer_texts.get(data['offerType'], f"Earn {data['coinAmount']} InCash!"),
+                'offerText': offer_text,
                 'coinAmount': data['coinAmount'],
                 'reason': data.get('reason', 'special_offer'),
                 'timestamp': data['timestamp']
             }
-
-            # Queue high-priority notification
-            NotificationQueueService.queue_notification(notification_data, immediate=True)
+            NotificationQueueService.smart_queue_notification(notification_data, immediate=True)
 
             # Log rare offer
             NotificationQueueService.log_rare_offer(data['userId'], data['offerType'], data['coinAmount'])
@@ -397,21 +562,49 @@ class NotificationEventService:
 
             # Get character info
             character_name = NotificationQueueService.get_character_name(data['characterId'])
+            personalized_hook = data.get('personalizedHook', f"{character_name} wants to continue your conversation")
 
-            # Create AI nudge notification
+            # Check if user is in quiet/paused state
+            is_quiet, quiet_reason = NotificationQueueService.is_user_in_quiet_state(data['userId'])
+
+            # ALWAYS save notification to Firestore for notification center
+            notification_doc = {
+                'userId': data['userId'],
+                'type': 'ai_nudge',
+                'title': character_name,
+                'body': personalized_hook,
+                'isRead': False,
+                'createdAt': firestore.SERVER_TIMESTAMP,
+                'data': {
+                    'characterId': data['characterId'],
+                    'characterName': character_name,
+                    'chatId': data['lastChatId']
+                }
+            }
+            
+            # Add quietDigest flag if in quiet state
+            if is_quiet:
+                notification_doc['quietDigest'] = True
+            db.collection('notifications').add(notification_doc)
+
+            # Check preferences before sending push notification
+            if not NotificationPreferenceService.should_send_notification(data['userId'], 'ai_nudge'):
+                return jsonify({"success": True, "message": "Notification saved to Firestore, push blocked by preferences"}), 200
+
+            # Create AI nudge push notification
             notification_data = {
                 'type': 'ai_nudge',
                 'userId': data['userId'],
                 'characterId': data['characterId'],
                 'characterName': character_name,
                 'chatId': data['lastChatId'],
-                'personalizedHook': data.get('personalizedHook', f"{character_name} wants to continue your conversation"),
+                'personalizedHook': personalized_hook,
                 'timestamp': data['timestamp']
             }
 
             # Queue with slight delay for natural feel
             delay_minutes = random.randint(5, 30)
-            NotificationQueueService.queue_notification(notification_data, delay_minutes=delay_minutes)
+            NotificationQueueService.smart_queue_notification(notification_data, delay_minutes=delay_minutes)
 
             return jsonify({"success": True, "message": "AI nudge notification queued"}), 200
 
@@ -477,6 +670,7 @@ class NotificationEventService:
             if replier_id == parent_comment_author_id:
                 return jsonify({"success": True, "message": "No notification sent - user replied to own comment"}), 200
 
+            # ALWAYS save to Firestore - preferences only checked for push
             # Find the post owner
             collections = ['humanPosts', 'reposts', 'aiPosts']
             for collection in collections:
@@ -491,6 +685,9 @@ class NotificationEventService:
 
             # Get replier's username
             replier_username = NotificationQueueService.get_user_name(replier_id)
+
+            # Check if user is in quiet/paused state
+            is_quiet, quiet_reason = NotificationQueueService.is_user_in_quiet_state(parent_comment_author_id)
 
             # Create and store notification for the parent comment author
             notification_data = {
@@ -512,10 +709,21 @@ class NotificationEventService:
                     'postAuthorId': post_author_id
                 }
             }
+            
+            # Add quietDigest flag if in quiet state
+            if is_quiet:
+                notification_data['quietDigest'] = True
 
             # Store notification in Firestore
             notification_ref = db.collection('notifications').add(notification_data)
             notification_id = notification_ref[1].id
+
+            # Check preferences before sending push notification
+            if not NotificationPreferenceService.should_send_notification(
+                parent_comment_author_id, 'comment', replier_id
+            ):
+                logger.info(f"Push notification blocked by preferences for user {parent_comment_author_id}")
+                return jsonify({"success": True, "message": "Notification saved to Firestore, push blocked by preferences"}), 200
 
             # Send push notification directly
             try:

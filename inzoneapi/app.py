@@ -31,6 +31,7 @@ from routes.notifications.events import notif_events_bp
 from routes.notifications.preferences import notif_prefs_bp
 from routes.notifications.push import notif_push_bp
 from routes.notifications.debug import notif_debug_bp
+from routes.notifications.digest import digest_bp
 from routes.admin.store import admin_store_bp
 from routes.admin.groups import admin_groups_bp
 from routes.admin.feed_config import admin_feed_config_bp
@@ -80,6 +81,7 @@ app.register_blueprint(notif_events_bp)
 app.register_blueprint(notif_prefs_bp)
 app.register_blueprint(notif_push_bp)
 app.register_blueprint(notif_debug_bp)
+app.register_blueprint(digest_bp)
 app.register_blueprint(admin_store_bp)
 app.register_blueprint(admin_groups_bp)
 app.register_blueprint(admin_feed_config_bp)
@@ -182,6 +184,16 @@ from routes.ai.maintenance import ai_maintenance_bp, init_maintenance_service
 maintenance_service = AIDataMaintenanceService(db)
 init_maintenance_service(maintenance_service)
 app.register_blueprint(ai_maintenance_bp)
+
+# ---------------------------
+# Initialize Digest Timer Manager
+# ---------------------------
+from services.notifications.digest_timer import digest_timer_manager
+
+# Schedule digest timers for users currently in quiet hours
+logger.info("Initializing digest timers...")
+digest_timer_manager.initialize_timers()
+logger.info("Digest timer initialization complete")
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8080)
