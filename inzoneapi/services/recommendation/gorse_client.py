@@ -441,6 +441,276 @@ class GorseClient:
             print(f"[Firestore] Error getting diverse posts: {e}")
             return []
 
+    def get_items_by_media_type_firestore(self, label: str, media_type: str, n: int = 100, user_id: str = None) -> List[str]:
+        """
+        Get posts with specific masterCategory AND media type from Firestore
+
+        Args:
+            label: The category label to filter by
+            media_type: 'video', 'image', or 'text'
+            n: Maximum number of items to return
+            user_id: User ID for consistent per-user shuffle (optional)
+
+        Returns:
+            List of post IDs matching label and media type (shuffled for variety)
+        """
+        try:
+            import random
+            import hashlib
+            from datetime import date
+
+            post_ids = []
+            fetch_limit = min(n * 5, 1000)  # Fetch 5x what we need, max 1000
+
+            # Build media type filter conditions
+            def matches_media_type(post_data):
+                has_video = post_data.get('has_video', False)
+                has_image = post_data.get('has_image', False)
+
+                if media_type == 'video':
+                    return has_video
+                elif media_type == 'image':
+                    return has_image and not has_video
+                elif media_type == 'text':
+                    return not has_video and not has_image
+                return False
+
+            # Query humanPosts with this category
+            try:
+                human_posts = db.collection('humanPosts')\
+                    .where('masterCategories', 'array_contains', label)\
+                    .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                    .limit(fetch_limit)\
+                    .stream()
+
+                for post in human_posts:
+                    post_data = post.to_dict()
+                    if matches_media_type(post_data):
+                        post_ids.append(post.id)
+            except Exception as e:
+                # Fallback if index doesn't exist
+                print(f"[Firestore] Index may be needed for humanPosts ordering: {e}")
+                print(f"[Firestore] Falling back to unordered query...")
+                human_posts = db.collection('humanPosts')\
+                    .where('masterCategories', 'array_contains', label)\
+                    .limit(fetch_limit)\
+                    .stream()
+
+                for post in human_posts:
+                    post_data = post.to_dict()
+                    if matches_media_type(post_data):
+                        post_ids.append(post.id)
+
+            # Query aiPosts with this category
+            try:
+                ai_posts = db.collection('aiPosts')\
+                    .where('masterCategories', 'array_contains', label)\
+                    .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                    .limit(fetch_limit)\
+                    .stream()
+
+                for post in ai_posts:
+                    post_data = post.to_dict()
+                    if matches_media_type(post_data):
+                        post_ids.append(post.id)
+            except Exception as e:
+                # Fallback if index doesn't exist
+                print(f"[Firestore] Index may be needed for aiPosts ordering: {e}")
+                print(f"[Firestore] Falling back to unordered query...")
+                ai_posts = db.collection('aiPosts')\
+                    .where('masterCategories', 'array_contains', label)\
+                    .limit(fetch_limit)\
+                    .stream()
+
+                for post in ai_posts:
+                    post_data = post.to_dict()
+                    if matches_media_type(post_data):
+                        post_ids.append(post.id)
+
+            # Deterministic shuffle based on user_id + current date
+            if user_id:
+                today = date.today().isoformat()
+                seed_string = f"{user_id}_{label}_{media_type}_{today}"
+                seed = int(hashlib.md5(seed_string.encode()).hexdigest(), 16) % (2**32)
+                random.seed(seed)
+
+            random.shuffle(post_ids)
+            random.seed()  # Reset to random seed
+
+            print(f"[Firestore] Found {len(post_ids)} {media_type} posts for label '{label}' (shuffled)")
+            return post_ids[:n]
+
+        except Exception as e:
+            print(f"[Firestore] Error getting {media_type} posts by label '{label}': {e}")
+            return []
+
+    def get_video_posts_cross_category(self, preferred_labels: List[str], n: int = 100, user_id: str = None, exclude_ids: set = None) -> List[str]:
+        """
+        Get video posts with cross-category fallback
+
+        1. Try to fetch videos from preferred categories first
+        2. If insufficient, fetch videos from ANY category (cross-category fallback)
+
+        Args:
+            preferred_labels: User's preferred category labels
+            n: Target number of videos to return
+            user_id: User ID for shuffle consistency
+            exclude_ids: Post IDs to exclude (already viewed)
+
+        Returns:
+            List of video post IDs (up to n)
+        """
+        try:
+            import random
+            import hashlib
+            from datetime import date
+            from config.feed_config import feed_config
+
+            if exclude_ids is None:
+                exclude_ids = set()
+
+            video_ids = []
+
+            # Phase 1: Fetch videos from preferred categories
+            print(f"[VideoFetch] Fetching videos from {len(preferred_labels)} preferred categories...")
+            for label in preferred_labels:
+                videos = self.get_items_by_media_type_firestore(label, 'video', n=n * 2, user_id=user_id)
+                video_ids.extend(videos)
+
+            # Remove duplicates and excluded IDs
+            video_ids = [vid for vid in list(set(video_ids)) if vid not in exclude_ids]
+
+            print(f"[VideoFetch] Found {len(video_ids)} videos from preferred categories (target: {n})")
+
+            # Phase 2: Cross-category fallback if needed and enabled
+            if len(video_ids) < n and feed_config.video_cross_category_fallback:
+                shortage = n - len(video_ids)
+                print(f"[VideoFetch] ⚠️  Shortage of {shortage} videos in preferred categories, applying cross-category fallback...")
+
+                fetch_limit = min(shortage * 5, 1000)
+                cross_category_videos = []
+
+                # Fetch videos from ANY category (no category filter, just has_video=True)
+                try:
+                    human_videos = db.collection('humanPosts')\
+                        .where('has_video', '==', True)\
+                        .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                        .limit(fetch_limit // 2)\
+                        .stream()
+
+                    for post in human_videos:
+                        if post.id not in exclude_ids and post.id not in video_ids:
+                            cross_category_videos.append(post.id)
+                except Exception as e:
+                    print(f"[VideoFetch] Index may be needed for humanPosts video ordering: {e}")
+                    # Fallback without ordering
+                    human_videos = db.collection('humanPosts')\
+                        .where('has_video', '==', True)\
+                        .limit(fetch_limit // 2)\
+                        .stream()
+
+                    for post in human_videos:
+                        if post.id not in exclude_ids and post.id not in video_ids:
+                            cross_category_videos.append(post.id)
+
+                try:
+                    ai_videos = db.collection('aiPosts')\
+                        .where('has_video', '==', True)\
+                        .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                        .limit(fetch_limit // 2)\
+                        .stream()
+
+                    for post in ai_videos:
+                        if post.id not in exclude_ids and post.id not in video_ids:
+                            cross_category_videos.append(post.id)
+                except Exception as e:
+                    print(f"[VideoFetch] Index may be needed for aiPosts video ordering: {e}")
+                    # Fallback without ordering
+                    ai_videos = db.collection('aiPosts')\
+                        .where('has_video', '==', True)\
+                        .limit(fetch_limit // 2)\
+                        .stream()
+
+                    for post in ai_videos:
+                        if post.id not in exclude_ids and post.id not in video_ids:
+                            cross_category_videos.append(post.id)
+
+                # Deterministic shuffle for cross-category videos
+                if user_id and cross_category_videos:
+                    today = date.today().isoformat()
+                    seed_string = f"{user_id}_cross_cat_videos_{today}"
+                    seed = int(hashlib.md5(seed_string.encode()).hexdigest(), 16) % (2**32)
+                    random.seed(seed)
+                    random.shuffle(cross_category_videos)
+                    random.seed()
+
+                # Add cross-category videos to fill shortage
+                video_ids.extend(cross_category_videos[:shortage])
+                print(f"[VideoFetch] ✅ Added {min(len(cross_category_videos), shortage)} cross-category videos")
+
+            print(f"[VideoFetch] Returning {len(video_ids)} total videos (requested: {n})")
+            return video_ids[:n]
+
+        except Exception as e:
+            print(f"[VideoFetch] Error getting video posts: {e}")
+            return []
+
+    def get_text_image_posts_category_only(self, preferred_labels: List[str], n: int = 100, user_id: str = None, exclude_ids: set = None) -> List[str]:
+        """
+        Get text/image posts from user's preferred categories ONLY
+
+        NO cross-category fallback for non-video content
+
+        Args:
+            preferred_labels: User's preferred category labels
+            n: Target number of posts to return
+            user_id: User ID for shuffle consistency
+            exclude_ids: Post IDs to exclude
+
+        Returns:
+            List of text/image post IDs (up to n)
+        """
+        try:
+            import random
+            import hashlib
+            from datetime import date
+
+            if exclude_ids is None:
+                exclude_ids = set()
+
+            post_ids = []
+
+            print(f"[TextImageFetch] Fetching text/image posts from {len(preferred_labels)} preferred categories...")
+
+            # Fetch both image and text posts from preferred categories
+            for label in preferred_labels:
+                # Get image posts (has_image=True, has_video=False)
+                image_posts = self.get_items_by_media_type_firestore(label, 'image', n=n, user_id=user_id)
+                post_ids.extend(image_posts)
+
+                # Get text-only posts (has_image=False, has_video=False)
+                text_posts = self.get_items_by_media_type_firestore(label, 'text', n=n, user_id=user_id)
+                post_ids.extend(text_posts)
+
+            # Remove duplicates and excluded IDs
+            post_ids = [pid for pid in list(set(post_ids)) if pid not in exclude_ids]
+
+            # Shuffle with deterministic seed
+            if user_id and post_ids:
+                today = date.today().isoformat()
+                seed_string = f"{user_id}_text_image_{today}"
+                seed = int(hashlib.md5(seed_string.encode()).hexdigest(), 16) % (2**32)
+                random.seed(seed)
+                random.shuffle(post_ids)
+                random.seed()
+
+            print(f"[TextImageFetch] Found {len(post_ids)} text/image posts from preferred categories (requested: {n})")
+            return post_ids[:n]
+
+        except Exception as e:
+            print(f"[TextImageFetch] Error getting text/image posts: {e}")
+            return []
+
     def get_items_by_label(self, label: str, n: int = 100) -> List[str]:
         """
         Get all items with a specific label by paginating through the items API
@@ -634,43 +904,36 @@ class GorseClient:
         if exclude_set:
             print(f"[SmartRecs] 🚫 Excluding {len(exclude_set)} client-loaded posts + {len(viewed_posts_set)} Firestore-viewed posts = {len(all_excluded)} total excluded")
 
-        # Collect items from user's interest categories (100% category-based)
-        category_items = []
-        items_per_category = max(200, n * 5)  # Fetch MUCH more for variety (5x instead of 3x)
+        # NEW 50/50 VIDEO-TO-TEXT/IMAGE RATIO SYSTEM
+        # Calculate split based on video_ratio config (default 50%)
+        target_videos = int(n * feed_config.video_ratio)
+        target_text_image = n - target_videos
 
+        print(f"[SmartRecs] 🎬 Target ratio: {feed_config.video_ratio:.0%} videos ({target_videos}) + {1-feed_config.video_ratio:.0%} text/image ({target_text_image})")
         print(f"[SmartRecs] 🔍 User {user_id[:15]}... has viewed {len(viewed_posts)} posts total")
         print(f"[SmartRecs] 🎯 Fetching items for {len(user_labels)} labels: {user_labels[:3]}...")
-        for label in user_labels:
-            items = self.get_items_by_label_firestore(label, n=items_per_category, user_id=user_id)
-            category_items.extend(items)
 
-        # Remove duplicates
-        category_items = list(set(category_items))
-        print(f"[SmartRecs] 📦 Found {len(category_items)} unique category items (before filtering viewed)")
+        # Fetch videos with cross-category fallback
+        video_items = self.get_video_posts_cross_category(
+            preferred_labels=user_labels,
+            n=target_videos * 5,  # Fetch 5x for variety and scoring
+            user_id=user_id,
+            exclude_ids=all_excluded
+        )
+        print(f"[SmartRecs] 📹 Found {len(video_items)} video candidates (target: {target_videos})")
 
-        # Filter out already viewed posts AND client-loaded posts
-        category_items_before = len(category_items)
-        category_items = [item_id for item_id in category_items if item_id not in all_excluded]
-        filtered_out = category_items_before - len(category_items)
-        print(f"[SmartRecs] ✂️  Filtered out {filtered_out} excluded posts (viewed + client-loaded)")
-        print(f"[SmartRecs] ✅ {len(category_items)} fresh posts remaining for recommendations")
+        # Fetch text/image from preferred categories only (no cross-category fallback)
+        text_image_items = self.get_text_image_posts_category_only(
+            preferred_labels=user_labels,
+            n=target_text_image * 5,  # Fetch 5x for variety and scoring
+            user_id=user_id,
+            exclude_ids=all_excluded
+        )
+        print(f"[SmartRecs] 📝 Found {len(text_image_items)} text/image candidates (target: {target_text_image})")
 
-        # If we don't have enough posts from user's categories, fetch random posts from ANY category
-        if len(category_items) < n:
-            needed = n - len(category_items)
-            print(f"[SmartRecs] Not enough category posts ({len(category_items)}/{n}), fetching {needed} random posts from any category...")
-            
-            # Fetch diverse posts (no category filter)
-            random_items = self.get_diverse_posts_firestore(n=needed * 3, user_id=user_id)  # Fetch 3x for filtering
-            
-            # Remove duplicates and already excluded (viewed + client-loaded)
-            random_items = [item_id for item_id in random_items if item_id not in all_excluded and item_id not in category_items]
-            
-            if random_items:
-                category_items.extend(random_items[:needed])  # Add only what we need
-                print(f"[SmartRecs] Added {len(random_items[:needed])} random posts, total now: {len(category_items)}")
-            else:
-                print(f"[SmartRecs] No random posts available after filtering")
+        # Combine for backward compatibility with scoring section
+        category_items = video_items + text_image_items
+        print(f"[SmartRecs] ✅ {len(category_items)} total posts ready for scoring ({len(video_items)} videos + {len(text_image_items)} text/image)")
 
         # Score each item by recency and popularity
         # OPTIMIZATION: Batch fetch posts to reduce Firestore queries
@@ -817,99 +1080,58 @@ class GorseClient:
             for i, (item_id, final, recency, popularity, category) in enumerate(scored_items[:3]):
                 print(f"  {i+1}. {item_id[:15]}... | Score: {final:.3f} (R:{recency:.2f}, P:{popularity:.2f}, C:{category:.2f})")
 
-        # Take top N items based on score
-        recommendations.extend([item_id for item_id, _, _, _, _ in scored_items[:n]])
+        # SEPARATE SCORED ITEMS INTO VIDEO AND TEXT/IMAGE POOLS
+        print(f"[SmartRecs] 🎨 Applying 50/50 video-to-text/image ratio enforcement...")
 
-        # CONTENT DIVERSITY: Mix up media types (images, videos, text) for variety
-        # Group recommendations by media type, then interleave them
-        print(f"[SmartRecs] 🎨 Applying content diversity mixing...")
-        
-        # Categorize by media type
-        video_posts = []
-        image_posts = []
-        text_posts = []
-        
-        for item_id in recommendations:
+        scored_video_items = []
+        scored_text_image_items = []
+
+        for item_id, final, recency, popularity, category in scored_items:
             if item_id in posts_data:
                 post_data, _ = posts_data[item_id]
                 has_video = post_data.get('has_video', False)
-                has_image = post_data.get('has_image', False)
-                
+
                 if has_video:
-                    video_posts.append(item_id)
-                elif has_image:
-                    image_posts.append(item_id)
+                    scored_video_items.append((item_id, final, recency, popularity, category))
                 else:
-                    text_posts.append(item_id)
+                    scored_text_image_items.append((item_id, final, recency, popularity, category))
             else:
-                # If not in posts_data, treat as text post
-                text_posts.append(item_id)
-        
-        print(f"[SmartRecs] Media breakdown: {len(video_posts)} videos, {len(image_posts)} images, {len(text_posts)} text")
-        
-        # IMPROVED INTERLEAVING: Distribute media types evenly throughout the list
-        # Use weighted round-robin to ensure good mixing even with unbalanced counts
+                # If not in posts_data, treat as text/image post
+                scored_text_image_items.append((item_id, final, recency, popularity, category))
+
+        print(f"[SmartRecs] Pool breakdown: {len(scored_video_items)} scored videos, {len(scored_text_image_items)} scored text/image")
+
+        # Take top-scored from each pool based on target ratio
+        top_videos = [item_id for item_id, _, _, _, _ in scored_video_items[:target_videos]]
+        top_text_image = [item_id for item_id, _, _, _, _ in scored_text_image_items[:target_text_image]]
+
+        print(f"[SmartRecs] Selected: {len(top_videos)}/{target_videos} videos, {len(top_text_image)}/{target_text_image} text/image")
+
+        # STRICT 50/50 ALTERNATING MERGE: V-T-V-T-V-T...
+        # This ensures even distribution throughout the feed
         mixed_recommendations = []
-        total_posts = len(video_posts) + len(image_posts) + len(text_posts)
-        
-        if total_posts > 0:
-            # Calculate how often to insert each type (as a ratio)
-            video_ratio = len(video_posts) / total_posts if video_posts else 0
-            image_ratio = len(image_posts) / total_posts if image_posts else 0
-            text_ratio = len(text_posts) / total_posts if text_posts else 0
-            
-            # Track positions in each list
-            video_idx = 0
-            image_idx = 0
-            text_idx = 0
-            
-            # Use fractional counters for weighted distribution
-            video_counter = 0.0
-            image_counter = 0.0
-            text_counter = 0.0
-            
-            while len(mixed_recommendations) < total_posts:
-                # Add from the type with the highest counter
-                # This ensures proportional distribution
-                
-                if video_idx < len(video_posts):
-                    video_counter += video_ratio
-                if image_idx < len(image_posts):
-                    image_counter += image_ratio
-                if text_idx < len(text_posts):
-                    text_counter += text_ratio
-                
-                # Pick the type with highest counter and add one post
-                if video_counter >= image_counter and video_counter >= text_counter and video_idx < len(video_posts):
-                    mixed_recommendations.append(video_posts[video_idx])
-                    video_idx += 1
-                    video_counter -= 1.0
-                elif image_counter >= text_counter and image_idx < len(image_posts):
-                    mixed_recommendations.append(image_posts[image_idx])
-                    image_idx += 1
-                    image_counter -= 1.0
-                elif text_idx < len(text_posts):
-                    mixed_recommendations.append(text_posts[text_idx])
-                    text_idx += 1
-                    text_counter -= 1.0
-                else:
-                    # Safety: add any remaining posts
-                    if video_idx < len(video_posts):
-                        mixed_recommendations.append(video_posts[video_idx])
-                        video_idx += 1
-                    elif image_idx < len(image_posts):
-                        mixed_recommendations.append(image_posts[image_idx])
-                        image_idx += 1
-                    elif text_idx < len(text_posts):
-                        mixed_recommendations.append(text_posts[text_idx])
-                        text_idx += 1
-                    else:
-                        break  # All exhausted
-        
-        # Use mixed recommendations if we successfully categorized posts
-        if mixed_recommendations:
-            recommendations = mixed_recommendations[:n]
-            print(f"[SmartRecs] ✅ Mixed {len(recommendations)} posts by media type for variety")
+        max_length = max(len(top_videos), len(top_text_image))
+
+        for i in range(max_length):
+            if i < len(top_videos):
+                mixed_recommendations.append(top_videos[i])
+            if i < len(top_text_image):
+                mixed_recommendations.append(top_text_image[i])
+
+        # Final recommendations
+        recommendations = mixed_recommendations[:n]
+
+        # Log achieved ratio for monitoring
+        actual_video_count = len([r for r in recommendations if r in video_items])
+        actual_ratio = actual_video_count / len(recommendations) if recommendations else 0
+
+        print(f"[SmartRecs] ✅ Final: {len(recommendations)} posts (V-T-V-T pattern)")
+        print(f"[SmartRecs] 📊 Achieved ratio: {actual_video_count} videos ({actual_ratio:.0%}) + {len(recommendations)-actual_video_count} text/image ({1-actual_ratio:.0%})")
+
+        # Warn if ratio deviates significantly from target
+        if abs(actual_ratio - feed_config.video_ratio) > 0.1:
+            print(f"[SmartRecs] ⚠️  RATIO WARNING: Target {feed_config.video_ratio:.0%}, achieved {actual_ratio:.0%}")
+            print(f"[SmartRecs] ⚠️  Videos available: {len(scored_video_items)}, Text/Image available: {len(scored_text_image_items)}")
 
         # BATCH VARIATION: Apply rotation based on batch_number to give users variety
         # This ensures different batches show different content without resetting viewed history

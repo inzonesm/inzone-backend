@@ -697,6 +697,11 @@ class FeedService:
                 first_ids = [p.get('id', '?')[:15] for p in post_objects[:3]]
                 logger.info(f"[SmartRecs] First 3 IDs: {first_ids}")
 
+            # Calculate media breakdown stats for monitoring 50/50 ratio
+            video_count = len([p for p in post_objects if p.get('has_video')])
+            image_count = len([p for p in post_objects if p.get('has_image') and not p.get('has_video')])
+            text_count = len(post_objects) - video_count - image_count
+
             result = {
                 "success": True,
                 "recommendations": post_objects,  # Flutter expects this key with full post objects
@@ -709,7 +714,13 @@ class FeedService:
                     "ranking_enabled": use_ranking,
                     "page": page,  # Current page number
                     "batch_number": batch_number,  # Current batch number
-                    "pool_size": len(recommendations)  # Total pool size for this batch
+                    "pool_size": len(recommendations),  # Total pool size for this batch
+                    "media_breakdown": {
+                        "videos": video_count,
+                        "images": image_count,
+                        "text": text_count,
+                        "video_ratio": round(video_count / len(post_objects), 2) if post_objects else 0
+                    }
                 }
             }
 

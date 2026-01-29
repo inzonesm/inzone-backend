@@ -53,6 +53,11 @@ class FeedConfigService:
                     "diversity": {
                         "enabled": true,
                         "strength": 1.0
+                    },
+                    "media_ratio": {
+                        "video_ratio": 0.5,
+                        "enforce_strict": true,
+                        "video_cross_category_fallback": true
                     }
                 }
 
@@ -74,6 +79,7 @@ class FeedConfigService:
             logger.info(f"  Media Boosts: Video={feed_config.video_boost:.2f}, Image={feed_config.image_boost:.2f}, Text={feed_config.text_boost:.2f}")
             logger.info(f"  User Boosts: Human={feed_config.human_boost:.2f}, Influencer={feed_config.influencer_boost:.2f}")
             logger.info(f"  Diversity: Enabled={feed_config.enable_media_diversity}, Strength={feed_config.diversity_strength:.2f}")
+            logger.info(f"  Media Ratio: Video={feed_config.video_ratio:.0%}, Enforce={feed_config.enforce_strict_media_ratio}, CrossCategory={feed_config.video_cross_category_fallback}")
 
             return jsonify({
                 'success': True,
