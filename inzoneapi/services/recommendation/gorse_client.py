@@ -382,6 +382,119 @@ class GorseClient:
             print(f"[Firestore] Error getting posts by label '{label}': {e}")
             return []
 
+    def get_text_image_posts_any_category(self, n: int = 100, user_id: str = None, exclude_ids: set = None, exclude_categories: List[str] = None) -> List[str]:
+        """
+        Get text/image posts from ANY category efficiently (single query, no category iteration)
+
+        This is used for fallback when user's preferred categories are exhausted.
+        Much faster than iterating through all categories individually.
+
+        Args:
+            n: Target number of posts to return
+            user_id: User ID for shuffle consistency
+            exclude_ids: Post IDs to exclude (already viewed/recommended)
+            exclude_categories: Categories to exclude (user's preferred categories)
+
+        Returns:
+            List of text/image post IDs (up to n)
+        """
+        try:
+            import random
+            import hashlib
+            from datetime import date
+
+            if exclude_ids is None:
+                exclude_ids = set()
+            if exclude_categories is None:
+                exclude_categories = []
+
+            post_ids = []
+            fetch_limit = min(n * 5, 500)  # Fetch 5x what we need, max 500
+
+            # Helper to check if post is text or image (not video)
+            def is_text_or_image(post_data):
+                has_video = post_data.get('has_video', False)
+                return not has_video  # Anything that's not a video
+
+            # Helper to check if post should be excluded based on categories
+            def should_exclude_by_category(post_data):
+                if not exclude_categories:
+                    return False
+                post_categories = post_data.get('masterCategories', [])
+                # Exclude if ALL of post's categories are in user's preferred list
+                # (Keep posts that have at least one category NOT in user's preferred)
+                if not post_categories:
+                    return False
+                return all(cat in exclude_categories for cat in post_categories)
+
+            # Query humanPosts without category filter (just recent posts)
+            try:
+                human_posts = db.collection('humanPosts')\
+                    .where('has_video', '==', False)\
+                    .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                    .limit(fetch_limit)\
+                    .stream()
+
+                for post in human_posts:
+                    if post.id not in exclude_ids:
+                        post_data = post.to_dict()
+                        if not should_exclude_by_category(post_data):
+                            post_ids.append(post.id)
+            except Exception as e:
+                # Fallback without ordering if index doesn't exist
+                human_posts = db.collection('humanPosts')\
+                    .where('has_video', '==', False)\
+                    .limit(fetch_limit)\
+                    .stream()
+
+                for post in human_posts:
+                    if post.id not in exclude_ids:
+                        post_data = post.to_dict()
+                        if not should_exclude_by_category(post_data):
+                            post_ids.append(post.id)
+
+            # Query aiPosts without category filter
+            try:
+                ai_posts = db.collection('aiPosts')\
+                    .where('has_video', '==', False)\
+                    .order_by('date_posted', direction=firestore.Query.DESCENDING)\
+                    .limit(fetch_limit)\
+                    .stream()
+
+                for post in ai_posts:
+                    if post.id not in exclude_ids:
+                        post_data = post.to_dict()
+                        if not should_exclude_by_category(post_data):
+                            post_ids.append(post.id)
+            except Exception as e:
+                # Fallback without ordering
+                ai_posts = db.collection('aiPosts')\
+                    .where('has_video', '==', False)\
+                    .limit(fetch_limit)\
+                    .stream()
+
+                for post in ai_posts:
+                    if post.id not in exclude_ids:
+                        post_data = post.to_dict()
+                        if not should_exclude_by_category(post_data):
+                            post_ids.append(post.id)
+
+            # Deterministic shuffle
+            if user_id and post_ids:
+                today = date.today().isoformat()
+                seed_string = f"{user_id}_fallback_text_image_{today}"
+                seed = int(hashlib.md5(seed_string.encode()).hexdigest(), 16) % (2**32)
+                random.seed(seed)
+                random.shuffle(post_ids)
+                random.seed()
+
+            print(f"[FallbackFetch] Found {len(post_ids)} text/image posts from other categories (2 queries)")
+            return post_ids[:n]
+
+        except Exception as e:
+            print(f"[FallbackFetch] Error getting text/image posts: {e}")
+            return []
+
     def get_diverse_posts_firestore(self, n: int = 100, user_id: str = None) -> List[str]:
         """
         Get diverse recent posts from ALL categories for exploration
@@ -441,13 +554,14 @@ class GorseClient:
             print(f"[Firestore] Error getting diverse posts: {e}")
             return []
 
-    def get_items_by_media_type_firestore(self, label: str, media_type: str, n: int = 100, user_id: str = None) -> List[str]:
+    def get_items_by_media_type_firestore(self, label: str, media_type: str, n: int = 100, user_id: str = None, verbose: bool = True) -> List[str]:
         """
         Get posts with specific masterCategory AND media type from Firestore
 
         Args:
             label: The category label to filter by
             media_type: 'video', 'image', or 'text'
+            verbose: Whether to print detailed logs (default True)
             n: Maximum number of items to return
             user_id: User ID for consistent per-user shuffle (optional)
 
@@ -537,11 +651,13 @@ class GorseClient:
             random.shuffle(post_ids)
             random.seed()  # Reset to random seed
 
-            print(f"[Firestore] Found {len(post_ids)} {media_type} posts for label '{label}' (shuffled)")
+            if verbose:
+                print(f"[Firestore] Found {len(post_ids)} {media_type} posts for label '{label}' (shuffled)")
             return post_ids[:n]
 
         except Exception as e:
-            print(f"[Firestore] Error getting {media_type} posts by label '{label}': {e}")
+            if verbose:
+                print(f"[Firestore] Error getting {media_type} posts by label '{label}': {e}")
             return []
 
     def get_video_posts_cross_category(self, preferred_labels: List[str], n: int = 100, user_id: str = None, exclude_ids: set = None) -> List[str]:
@@ -679,18 +795,24 @@ class GorseClient:
                 exclude_ids = set()
 
             post_ids = []
+            target_per_category = max(20, (n * 2) // max(1, len(preferred_labels)))  # Distribute fetch across categories
 
-            print(f"[TextImageFetch] Fetching text/image posts from {len(preferred_labels)} preferred categories...")
+            print(f"[TextImageFetch] Fetching text/image posts from {len(preferred_labels)} categories (target: {n})...")
 
             # Fetch both image and text posts from preferred categories
+            # OPTIMIZATION: Early exit once we have enough candidates
             for label in preferred_labels:
                 # Get image posts (has_image=True, has_video=False)
-                image_posts = self.get_items_by_media_type_firestore(label, 'image', n=n, user_id=user_id)
+                image_posts = self.get_items_by_media_type_firestore(label, 'image', n=target_per_category, user_id=user_id, verbose=False)
                 post_ids.extend(image_posts)
 
                 # Get text-only posts (has_image=False, has_video=False)
-                text_posts = self.get_items_by_media_type_firestore(label, 'text', n=n, user_id=user_id)
+                text_posts = self.get_items_by_media_type_firestore(label, 'text', n=target_per_category, user_id=user_id, verbose=False)
                 post_ids.extend(text_posts)
+
+                # Early exit if we have enough candidates (3x what we need for filtering)
+                if len(post_ids) >= n * 3:
+                    break
 
             # Remove duplicates and excluded IDs
             post_ids = [pid for pid in list(set(post_ids)) if pid not in exclude_ids]
@@ -1148,69 +1270,67 @@ class GorseClient:
 
         print(f"[SmartRecs] Returning {len(recommendations)} recommendations")
 
-        # FALLBACK: If still empty or insufficient, allow re-showing viewed posts
+        # FALLBACK: If still insufficient, fetch from OTHER CATEGORIES (maintaining 50/50 ratio)
         if len(recommendations) < n:
             shortage = n - len(recommendations)
             print(f"[SmartRecs] ⚠️  WARNING: Only found {len(recommendations)} unviewed posts, need {n}")
-            print(f"[SmartRecs] ⚠️  User has exhausted fresh content! Re-showing {shortage} previously viewed posts...")
-            print(f"[SmartRecs] 💡 SOLUTION: Add more posts to database OR wait for new content")
+            print(f"[SmartRecs] 🔄 Fetching {shortage} posts from OTHER CATEGORIES (efficient single-query method)...")
 
-            # Re-fetch category items WITHOUT filtering (using Firestore)
-            fallback_items = []
-            for label in user_labels:
-                items = self.get_items_by_label_firestore(label, n=items_per_category)
-                fallback_items.extend(items)
+            # Calculate how many videos vs text/image needed to maintain ratio
+            current_videos = len([r for r in recommendations if r in video_items])
+            current_text_image = len(recommendations) - current_videos
 
-            fallback_items = list(set(fallback_items))
+            # Calculate target counts including shortage
+            total_target_videos = int(n * feed_config.video_ratio)
+            total_target_text_image = n - total_target_videos
 
-            # Score fallback items (same logic as before, but without filtering)
-            fallback_scored = []
-            for item_id in fallback_items:
-                if item_id in recommendations:
-                    continue  # Skip items already added
+            shortage_videos = max(0, total_target_videos - current_videos)
+            shortage_text_image = max(0, total_target_text_image - current_text_image)
 
-                try:
-                    post_ref = db.collection('humanPosts').document(item_id)
-                    post_doc = post_ref.get()
+            print(f"[SmartRecs] 📊 Shortage breakdown: {shortage_videos} videos + {shortage_text_image} text/image needed")
 
-                    if not post_doc.exists:
-                        post_ref = db.collection('aiPosts').document(item_id)
-                        post_doc = post_ref.get()
+            fallback_videos = []
+            fallback_text_image = []
 
-                    if not post_doc.exists:
-                        continue
+            if shortage_videos > 0:
+                # Fetch videos using cross-category method (already efficient)
+                fallback_videos = self.get_video_posts_cross_category(
+                    preferred_labels=[],  # Empty = any category
+                    n=shortage_videos * 3,  # Fetch 3x for filtering
+                    user_id=user_id,
+                    exclude_ids=set(recommendations)  # Don't duplicate
+                )
+                # Remove already recommended
+                fallback_videos = [vid for vid in fallback_videos if vid not in recommendations][:shortage_videos]
+                print(f"[SmartRecs] 🎬 Found {len(fallback_videos)} fallback videos")
 
-                    post_data = post_doc.to_dict()
+            if shortage_text_image > 0:
+                # Use NEW efficient method - single query instead of iterating all categories
+                fallback_text_image = self.get_text_image_posts_any_category(
+                    n=shortage_text_image * 3,  # Fetch 3x for filtering
+                    user_id=user_id,
+                    exclude_ids=set(recommendations),  # Don't duplicate
+                    exclude_categories=user_labels  # Exclude user's preferred categories
+                )
+                # Remove already recommended
+                fallback_text_image = [pid for pid in fallback_text_image if pid not in recommendations][:shortage_text_image]
+                print(f"[SmartRecs] 📝 Found {len(fallback_text_image)} fallback text/image posts")
 
-                    # Simple scoring for fallback (just use recency)
-                    post_date = post_data.get('date_posted')
-                    if post_date:
-                        try:
-                            if hasattr(post_date, 'timestamp'):
-                                post_datetime = datetime.fromtimestamp(post_date.timestamp(), tz=timezone.utc)
-                            else:
-                                post_datetime = post_date
+            # Merge fallback videos and text/image in alternating pattern
+            fallback_merged = []
+            max_length = max(len(fallback_videos), len(fallback_text_image))
 
-                            days_old = (datetime.now(timezone.utc) - post_datetime).days
-                            decay_rate = recency_weight / 7.0
-                            recency_score = math.exp(-days_old * decay_rate)
+            for i in range(max_length):
+                if i < len(fallback_videos):
+                    fallback_merged.append(fallback_videos[i])
+                if i < len(fallback_text_image):
+                    fallback_merged.append(fallback_text_image[i])
 
-                            fallback_scored.append((item_id, recency_score))
-                        except:
-                            pass
+            # Add fallback posts to recommendations
+            recommendations.extend(fallback_merged)
 
-                except Exception as e:
-                    continue
-
-            # Sort by recency and add to recommendations
-            fallback_scored.sort(key=lambda x: x[1], reverse=True)
-            for item_id, _ in fallback_scored:
-                if item_id not in recommendations:
-                    recommendations.append(item_id)
-                    if len(recommendations) >= n:
-                        break
-
-            print(f"[SmartRecs] Added {len(recommendations)} posts total (including {len(recommendations) - len([r for r in recommendations if r not in all_excluded])} re-shown posts)")
+            print(f"[SmartRecs] ✅ Added {len(fallback_merged)} posts from other categories ({len(fallback_videos)} videos + {len(fallback_text_image)} text/image)")
+            print(f"[SmartRecs] 📊 New total: {len(recommendations)} posts")
 
         # Final statistics
         fresh_posts = len([r for r in recommendations if r not in all_excluded])
