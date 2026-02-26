@@ -1187,11 +1187,33 @@ class FeedService:
             if not post_id:
                 return jsonify({"success": False, "error": "PostId is required", "code": "INVALID_POST_ID"}), 400
 
+            # Build the update payload, only including fields that were provided
             update_data = {
-                "content": data.get("Content"),
-                "imageUrl": data.get("ImageUrl"),
                 "updatedAt": firestore.SERVER_TIMESTAMP
             }
+
+            # Update text content (both top-level and nested for compatibility)
+            content = data.get("Content")
+            if content is not None:
+                update_data["content"] = content
+                update_data["post.text_content"] = content
+
+            # Update single image URL (legacy field)
+            image_url = data.get("ImageUrl")
+            if image_url is not None:
+                update_data["imageUrl"] = image_url
+
+            # Update image content list
+            image_content = data.get("ImageContent")
+            if image_content is not None:
+                update_data["post.image_content"] = image_content
+                update_data["has_image"] = bool(image_content)
+
+            # Update video content list
+            video_content = data.get("VideoContent")
+            if video_content is not None:
+                update_data["post.video_content"] = video_content
+                update_data["has_video"] = bool(video_content)
 
             collections = ['aiPosts', 'humanPosts', 'reposts']
             post_found = False
