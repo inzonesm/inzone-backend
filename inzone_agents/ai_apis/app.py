@@ -15,6 +15,108 @@ import re
 from datetime import datetime
 from pathlib import Path
 import firebase_admin
+from math import floor
+import cv2
+import tempfile
+import numpy as np
+
+
+def analyze_video_from_url(video_url: str, max_frames: int = 10, sample_rate: int = 30) -> str:
+    """
+    Download a video from URL, extract frames, and analyze with GPT-4o vision.
+    
+    Args:
+        video_url: URL of the video to analyze
+        max_frames: Maximum number of frames to extract (default 10 to keep costs reasonable)
+        sample_rate: Extract every Nth frame (default 30 = ~1 frame per second for 30fps video)
+    
+    Returns:
+        String description of the video content
+    """
+    temp_video_path = None
+    try:
+        # Download video to temporary file
+        response = requests.get(video_url, stream=True, timeout=30)
+        response.raise_for_status()
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_file:
+            for chunk in response.iter_content(chunk_size=8192):
+                temp_file.write(chunk)
+            temp_video_path = temp_file.name
+        
+        # Extract frames using OpenCV
+        video = cv2.VideoCapture(temp_video_path)
+        base64_frames = []
+        frame_count = 0
+        extracted_count = 0
+        
+        while video.isOpened() and extracted_count < max_frames:
+            success, frame = video.read()
+            if not success:
+                break
+            
+            # Sample frames at the specified rate
+            if frame_count % sample_rate == 0:
+                # Convert frame to JPEG and then to base64
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                base64_frame = base64.b64encode(buffer).decode('utf-8')
+                base64_frames.append(base64_frame)
+                extracted_count += 1
+            
+            frame_count += 1
+        
+        video.release()
+        
+        if not base64_frames:
+            return "Unable to extract frames from video"
+        
+        # Analyze frames with GPT-4o vision
+        frame_content = [
+            {
+                "type": "text",
+                "text": "Analyze this video by looking at these key frames. Describe what's happening, including actions, objects, people, setting, mood, and any text visible. Be concise but thorough (max 200 words)."
+            }
+        ]
+        
+        # Add frames (limit to prevent token overflow)
+        for frame in base64_frames[:max_frames]:
+            frame_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{frame}",
+                    "detail": "auto" 
+                }
+            })
+        
+        analysis_response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL"),
+            messages=[
+                {
+                    "role": "user",
+                    "content": frame_content
+                }
+            ],
+            max_tokens=300
+        )
+        
+        return analysis_response.choices[0].message.content
+    
+    except requests.RequestException as e:
+        logger.error(f"Error downloading video: {e}")
+        return f"Unable to download video from {video_url}"
+    except cv2.error as e:
+        logger.error(f"Error processing video with OpenCV: {e}")
+        return "Unable to process video format"
+    except Exception as e:
+        logger.error(f"Error in video analysis: {e}")
+        return "Video analysis failed"
+    finally:
+        # Clean up temporary file
+        if temp_video_path and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+            except OSError:
+                pass
 
 
 # --- citation-removal helper -----------------------------------
@@ -141,10 +243,13 @@ def chat_unpopular():
 def chat_popular():
     try:
         data = request.get_json()
-        message = data.get('message')
+        message = data.get('message', '')
+        image_url = data.get('imageUrl')
+        video_url = data.get('videoUrl')
 
-        if not message:
-            return jsonify({"success": False, "error": {"message": "Message is required", "code": "INVALID_MESSAGE"}}), 400
+        # At least one of message, imageUrl, or videoUrl must be provided
+        if not message and not image_url and not video_url:
+            return jsonify({"success": False, "error": {"message": "Message, image, or video is required", "code": "INVALID_MESSAGE"}}), 400
 
         ai_id = data.get('ai_id')
         if not ai_id:
@@ -218,6 +323,73 @@ def chat_popular():
             Your name is {NAME}, and you respond as they would in real-life interactions.
             """
         
+        # Analyze media content first if provided, to give character context
+        media_analysis = ""
+        
+        if image_url:
+            try:
+                # Quick image analysis
+                analysis_response = client.chat.completions.create(
+                    model=os.getenv("OPENAI_MODEL"),
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Describe this image in detail, including any text, objects, people, emotions, activities, or notable features. Be concise but thorough."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": image_url
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=300
+                )
+                media_analysis = f"\n[Image analysis: {analysis_response.choices[0].message.content}]"
+                logger.info(f"Image analyzed for character {NAME}")
+            except Exception as e:
+                logger.error(f"Error analyzing image: {e}")
+                media_analysis = "\n[User sent an image]"
+        
+        if video_url:
+            try:
+                # Download and analyze video using frame extraction
+                video_analysis = analyze_video_from_url(video_url)
+                media_analysis += f"\n[Video analysis: {video_analysis}]"
+                logger.info(f"Video analyzed for character {NAME}")
+            except Exception as e:
+                logger.error(f"Error analyzing video: {e}")
+                media_analysis += f"\n[User sent a video. Unable to analyze it automatically. You should acknowledge the video and ask the user to describe what's happening in it.]"
+        
+        # Build the user message content for Responses API
+        # Responses API supports multimodal arrays with input_text and input_image types
+        user_content = []
+        
+        # Add text if provided, with media analysis prepended
+        if message:
+            user_content.append({
+                "type": "input_text",
+                "text": message + media_analysis if media_analysis else message
+            })
+        elif media_analysis:
+            # If no text but we have media, use the analysis as the message
+            user_content.append({
+                "type": "input_text",
+                "text": media_analysis
+            })
+        
+        # Add image if provided (Responses API format)
+        if image_url:
+            user_content.append({
+                "type": "input_image",
+                "image_url": image_url
+            })
+        
         input_messages = [
             {
                 "role": "assistant",
@@ -225,7 +397,7 @@ def chat_popular():
             },
             {
                 "role": "user",
-                "content": message
+                "content": user_content if len(user_content) > 1 else (user_content[0]["text"] if user_content and user_content[0]["type"] == "input_text" else message)
             }
         ]
 
