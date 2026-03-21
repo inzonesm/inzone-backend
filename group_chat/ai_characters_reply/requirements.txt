@@ -1,0 +1,8 @@
+firebase-admin>=6.7.0
+firebase-functions>=0.1.0
+python-dotenv>=1.0.0
+autogen-agentchat>=0.4.7
+openai>=1.10.0
+python-dateutil>=2.8.2
+flask>=2.2.0
+gunicorn>=21.2.0

@@ -1,0 +1,23 @@
+{
+  "name": "ai-characters-reply",
+  "version": "1.0.0",
+  "description": "Firebase Cloud Functions for AI character replies in group chats",
+  "main": "index.js",
+  "engines": {
+    "node": "18"
+  },
+  "scripts": {
+    "serve": "firebase emulators:start --only functions",
+    "shell": "firebase functions:shell",
+    "start": "npm run shell",
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "firebase-admin": "^11.11.0",
+    "firebase-functions": "^4.5.0",
+    "uuid": "^9.0.1"
+  },
+  "private": true
+}

@@ -1,0 +1,18 @@
+{
+  "functions": {
+    "source": ".",
+    "runtime": "python312",
+    "ignore": [
+      ".git",
+      ".github",
+      ".vscode",
+      "node_modules",
+      "venv",
+      "__pycache__",
+      ".pytest_cache",
+      ".gitignore",
+      ".env",
+      "*.log"
+    ]
+  }
+}
