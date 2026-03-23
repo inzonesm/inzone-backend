@@ -11,7 +11,7 @@ const db = admin.firestore();
  * Cloud Function that triggers when a document in the groupChats collection is updated
  * Specifically responds when new messages are added
  */
-exports.processNewGroupChatMessages = functions.firestore
+exports.add_ai_message_on_update = functions.firestore
   .document('groupChats/{groupChatId}')
   .onUpdate(async (change, context) => {
     // Get the data before and after the update

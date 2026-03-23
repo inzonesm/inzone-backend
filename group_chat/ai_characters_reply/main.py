@@ -1,11 +1,6 @@
 import firebase_admin
 from firebase_admin import credentials, firestore
-from firebase_functions.firestore_fn import (
-    on_document_updated,
-    Event,
-    Change,
-    DocumentSnapshot
-)
+import json
 import os
 import logging
 from datetime import datetime
@@ -13,114 +8,148 @@ import uuid
 from orchestrator import ChatOrchestrator
 from utils import setup_environment
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('ai_characters_cloud_function')
 
-# Initialize Firebase Admin SDK
-# No need to explicitly initialize with credentials in deployed Cloud Functions
 firebase_admin.initialize_app()
 
-@on_document_updated(document="groupChats/{groupChatId}")
-def add_ai_message_on_update(event: Event[Change[DocumentSnapshot]]) -> None:
+def add_ai_message_on_update(data, context):
     """
-    Cloud Function that triggers when a document in the groupChats collection is updated
-    Specifically responds when new messages are added
-    
-    Args:
-        event: The event payload containing before and after snapshots
+    Cloud Function triggered when a Firestore document in groupChats is updated.
+    Uses the legacy (data, context) signature for 1st-gen Cloud Functions.
     """
     try:
-        # Get the data before and after the update
-        before_data = event.data.before.to_dict() if event.data.before else {}
-        after_data = event.data.after.to_dict() if event.data.after else {}
-        group_chat_id = event.params["groupChatId"]
-        
+        group_chat_id = _extract_group_chat_id_from_context(context)
+        if not group_chat_id:
+            payload = _normalize_event_payload(data)
+            name_path = payload.get("value", {}).get("name", "")
+            if name_path:
+                group_chat_id = name_path.split("/")[-1]
+
+        if not group_chat_id:
+            logger.info("Could not determine group chat ID from event context/payload.")
+            return
+
         logger.info(f"Processing update for group chat: {group_chat_id}")
-        
-        # Extract messages from before and after
-        before_messages = before_data.get("messages", [])
+
+        # Use the Firestore Admin SDK to get the full document (avoids dealing with raw field encoding)
+        db = firestore.client()
+        doc_ref = db.collection("groupChats").document(group_chat_id)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            logger.info("Document does not exist, exiting.")
+            return
+
+        after_data = doc.to_dict()
         after_messages = after_data.get("messages", [])
-        
-        # If no new messages were added, exit early
-        if len(after_messages) <= len(before_messages):
-            logger.info('No new messages detected, exiting early.')
+
+        if not after_messages:
+            logger.info("No messages in chat, exiting.")
             return
-            
-        # Get the last processed message ID
-        last_processed_id = before_data.get("lastProcessedMessageId", "")
-        
-        # Find new messages that need processing
-        new_messages = []
-        if last_processed_id:
-            # Find where the last processed message is in the list
-            last_idx = next((i for i, m in enumerate(after_messages) if m.get('id') == last_processed_id), -1)
-            if last_idx >= 0:
-                new_messages = after_messages[last_idx + 1:]
-            else:
-                # If the last processed message is not found, process all messages
-                # This shouldn't happen in normal operation
-                new_messages = after_messages
-        else:
-            new_messages = after_messages
-            
-        # Only continue if there are new messages and the last message is from a user
-        if not new_messages:
-            logger.info('No new messages to process, exiting.')
+
+        last_message = after_messages[-1]
+        last_message_id = last_message.get("id", "")
+        sender_type = (last_message.get("sender", {}).get("type") or "").lower()
+
+        if sender_type != "user":
+            logger.info(f"Last message sender type is '{sender_type or 'unknown'}', exiting.")
             return
-            
-        last_message = new_messages[-1]
-        if not last_message or last_message.get("sender", {}).get("type") != "user":
-            logger.info('Last message is not from a user, exiting.')
+
+        last_processed_user_message_id = after_data.get("lastProcessedUserMessageId", "")
+        if last_message_id and last_message_id == last_processed_user_message_id:
+            logger.info(
+                f"Latest user message already processed (id={last_message_id}), exiting."
+            )
             return
-            
-        logger.info(f"Processing {len(new_messages)} new messages in chat {group_chat_id}")
-        
-        # Get AI participants from the group chat
-        ai_participants = [p for p in after_data.get("participants", []) if p.get("type") == "ai"]
-        
+
+        logger.info(
+            f"Processing latest user message id={last_message_id or 'missing-id'} in chat {group_chat_id}"
+        )
+
+        ai_participants = [
+            p for p in after_data.get("participants", []) if p.get("type") == "ai"
+        ]
+
         if not ai_participants:
-            logger.info('No AI participants in this chat')
+            participant_types = [p.get("type", "unknown") for p in after_data.get("participants", [])]
+            logger.info(f"No AI participants in this chat. participant_types={participant_types}")
             return
-            
-        # Get the last 5 messages for context
-        last_five_messages = after_messages[-5:] if len(after_messages) > 5 else after_messages
-        
-        # Generate AI responses using the orchestrator
+
+        context_window_size = 12
+        recent_messages = (
+            after_messages[-context_window_size:]
+            if len(after_messages) > context_window_size
+            else after_messages
+        )
+
         try:
-            # Set up environment variables if needed
             setup_environment()
-            
-            # Initialize the orchestrator with the AI participants
             orchestrator = ChatOrchestrator(ai_participants)
-            
-            # Generate responses from AI characters
-            ai_responses = orchestrator.generate_responses(last_five_messages)
-            
+            ai_responses = orchestrator.generate_responses(recent_messages)
+
             if not ai_responses:
-                logger.info('No AI responses generated')
+                logger.info(
+                    f"No AI responses generated for latest user message id={last_message_id or 'missing-id'}."
+                )
                 return
-                
-            # Append AI responses to the messages
+
             updated_messages = after_messages + ai_responses
-            
-            # Update the document with new messages and last processed message ID
-            db = firestore.client()
-            db.collection("groupChats").document(group_chat_id).update({
+
+            doc_ref.update({
                 "messages": updated_messages,
                 "lastProcessedMessageId": ai_responses[-1]["id"],
+                "lastProcessedUserMessageId": last_message_id,
                 "updatedAt": firestore.SERVER_TIMESTAMP
             })
-            
+
             logger.info(f"Added {len(ai_responses)} AI responses to chat {group_chat_id}")
-            
+
         except Exception as e:
             logger.error(f"Error generating AI responses: {str(e)}")
             raise
-            
+
     except Exception as e:
         logger.error(f"Error processing document update: {str(e)}")
         raise
+
+
+def _normalize_event_payload(data):
+    if isinstance(data, dict):
+        return data
+
+    if isinstance(data, (bytes, bytearray)):
+        text = data.decode("utf-8")
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError("Decoded event payload is not a JSON object")
+
+    if isinstance(data, str):
+        parsed = json.loads(data)
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError("Parsed event payload is not a JSON object")
+
+    raise TypeError(f"Unsupported event payload type: {type(data).__name__}")
+
+
+def _extract_group_chat_id_from_context(context):
+    if context is None:
+        return ""
+
+    resource = getattr(context, "resource", "")
+    if not resource:
+        return ""
+
+    if "/documents/" in resource:
+        doc_path = resource.split("/documents/", 1)[1]
+        parts = doc_path.split("/")
+        if len(parts) >= 2 and parts[0] == "groupChats":
+            return parts[1]
+
+    parts = resource.split("/")
+    return parts[-1] if parts else ""
