@@ -58,6 +58,7 @@ firebase use your-project-id
 # Deploy the function
 firebase deploy --only functions
 ```
+$envFile = '.env'; $openaiKey = ((Get-Content $envFile | Where-Object { $_ -match '^OPENAI_API_KEY=' } | Select-Object -First 1) -replace '^OPENAI_API_KEY=', '').Trim('"'); $openaiModel = ((Get-Content $envFile | Where-Object { $_ -match '^OPENAI_MODEL=' } | Select-Object -First 1) -replace '^OPENAI_MODEL=', '').Trim('"'); gcloud functions deploy add_ai_message_on_update --gen2 --project inzone-f93e4 --region us-central1 --runtime python312 --source . --entry-point add_ai_message_on_update --trigger-location nam5 --trigger-event-filters "type=google.cloud.firestore.document.v1.updated" --trigger-event-filters "database=(default)" --trigger-event-filters "namespace=(default)" --trigger-event-filters-path-pattern "document=groupChats/{groupChatId}" --set-env-vars "OPENAI_API_KEY=$openaiKey,OPENAI_MODEL=$openaiModel"
 
 ## Project Structure
 
