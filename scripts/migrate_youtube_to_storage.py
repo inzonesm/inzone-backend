@@ -66,7 +66,9 @@ stats = {
     'already_migrated': 0,
     'successfully_migrated': 0,
     'failed': 0,
-    'skipped': 0
+    'skipped': 0,
+    'deleted_failed': 0,
+    'deleted_duplicates': 0
 }
 
 
@@ -178,6 +180,18 @@ class YouTubeToStorageMigrator:
         self.progress['last_processed'] = doc_id
         self._save_progress()
     
+    def _delete_failed_doc(self, doc, video_id: str, reason: str):
+        """Delete a document from Firestore after migration failure"""
+        if self.dry_run:
+            logger.info(f"   [DRY RUN] Would delete document {doc.id} (video {video_id}, reason: {reason})")
+            return
+        try:
+            doc.reference.delete()
+            logger.info(f"   Deleted document {doc.id} (video {video_id}, reason: {reason})")
+            stats['deleted_failed'] += 1
+        except Exception as e:
+            logger.error(f"   Failed to delete document {doc.id}: {e}")
+
     def _mark_doc_failed(self, doc_id: str, video_id: str, error: str):
         """Mark a document as failed"""
         self.progress['failed_docs'][doc_id] = {
@@ -431,28 +445,64 @@ class YouTubeToStorageMigrator:
         if limit:
             query = query.limit(limit)
         
-        docs = list(query.stream())
-        logger.info(f"Found {len(docs)} documents to scan")
-        
-        # First pass: count videos to migrate
+        # Stream documents one at a time to avoid loading all into memory
+        logger.info(f"Scanning documents...")
+
+        # First pass: count videos to migrate and detect duplicates
         videos_to_migrate = []
-        for doc in docs:
-            doc_data = doc.to_dict()
-            
+        seen_video_ids = {}  # video_id -> first doc reference
+        duplicates_to_delete = []
+        doc_count = 0
+        for doc in query.stream():
+            doc_count += 1
+            try:
+                doc_data = doc.to_dict()
+            except (MemoryError, Exception) as e:
+                logger.warning(f"Skipping document {doc.id}: failed to read ({type(e).__name__}: {e})")
+                collection_stats['skipped'] += 1
+                stats['skipped'] += 1
+                continue
+
             if self.redownload:
                 # Redownload mode: find already migrated videos
                 migrated_videos = self.find_migrated_videos_for_redownload(doc_data)
                 for field_path, url in migrated_videos:
                     video_id = self.extract_youtube_video_id(url)
                     if video_id:
-                        videos_to_migrate.append((doc, field_path, url, video_id))
+                        if video_id in seen_video_ids:
+                            duplicates_to_delete.append((doc, video_id))
+                        else:
+                            seen_video_ids[video_id] = doc.id
+                            videos_to_migrate.append((doc, field_path, url, video_id))
             else:
                 # Normal mode: find YouTube videos not yet migrated
                 youtube_urls = self.find_youtube_videos_in_document(doc_data)
                 for field_path, url in youtube_urls:
                     video_id = self.extract_youtube_video_id(url)
                     if video_id and not self._is_doc_already_processed(doc.id, video_id):
-                        videos_to_migrate.append((doc, field_path, url, video_id))
+                        if video_id in seen_video_ids:
+                            duplicates_to_delete.append((doc, video_id))
+                        else:
+                            seen_video_ids[video_id] = doc.id
+                            videos_to_migrate.append((doc, field_path, url, video_id))
+
+        logger.info(f"Scanned {doc_count} documents")
+
+        # Delete duplicate documents
+        if duplicates_to_delete:
+            logger.info(f"Found {len(duplicates_to_delete)} duplicate videos, deleting...")
+            for dup_doc, dup_video_id in duplicates_to_delete:
+                kept_doc_id = seen_video_ids[dup_video_id]
+                if self.dry_run:
+                    logger.info(f"   [DRY RUN] Would delete duplicate {dup_doc.id} (video {dup_video_id}, keeping {kept_doc_id})")
+                else:
+                    try:
+                        dup_doc.reference.delete()
+                        logger.info(f"   Deleted duplicate {dup_doc.id} (video {dup_video_id}, keeping {kept_doc_id})")
+                    except Exception as e:
+                        logger.error(f"   Failed to delete duplicate {dup_doc.id}: {e}")
+                collection_stats['skipped'] += 1
+                stats['deleted_duplicates'] += 1
         
         total_videos = len(videos_to_migrate)
         mode_str = "to redownload in best quality" if self.redownload else "to migrate"
@@ -486,15 +536,19 @@ class YouTubeToStorageMigrator:
                     self._mark_doc_failed(doc.id, video_id, "Download failed")
                     collection_stats['failed'] += 1
                     stats['failed'] += 1
+                    # Delete the document from collection on failure
+                    self._delete_failed_doc(doc, video_id, "Download failed")
                     continue
-                
+
                 # Upload to Firebase Storage
                 storage_url = self.upload_to_storage(local_path, video_id)
-                
+
                 if not storage_url:
                     self._mark_doc_failed(doc.id, video_id, "Upload failed")
                     collection_stats['failed'] += 1
                     stats['failed'] += 1
+                    # Delete the document from collection on failure
+                    self._delete_failed_doc(doc, video_id, "Upload failed")
                     continue
                 
                 # Update Firestore document
@@ -516,6 +570,7 @@ class YouTubeToStorageMigrator:
                     self._mark_doc_failed(doc.id, video_id, "Database update failed")
                     collection_stats['failed'] += 1
                     stats['failed'] += 1
+                    self._delete_failed_doc(doc, video_id, "Database update failed")
         
         return collection_stats
     
@@ -556,6 +611,8 @@ class YouTubeToStorageMigrator:
         logger.info(f"   Already migrated (skipped):    {stats['already_migrated']}")
         logger.info(f"   Successfully migrated (new):   {stats['successfully_migrated']}")
         logger.info(f"   Failed:                        {stats['failed']}")
+        logger.info(f"   Deleted (failed migration):    {stats['deleted_failed']}")
+        logger.info(f"   Deleted (duplicates):          {stats['deleted_duplicates']}")
         logger.info(f"   Skipped (other reasons):       {stats['skipped']}")
         logger.info(f"\n📁 Progress tracking:")
         logger.info(f"   Total migrated (all runs):     {self.progress['total_migrated']}")
