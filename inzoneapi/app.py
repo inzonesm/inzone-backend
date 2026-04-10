@@ -6,6 +6,7 @@ from config import Config
 # Import blueprints
 from routes.core.health import health_bp
 from routes.user.profile import user_profile_bp
+from routes.user.account_management import user_account_lifecycle_bp
 from routes.user.social import user_social_bp
 from routes.user.referral import user_referral_bp
 from routes.content.posts import posts_bp
@@ -56,6 +57,7 @@ app.config['SECRET_KEY'] = Config.SECRET_KEY
 # Register blueprints
 app.register_blueprint(health_bp)
 app.register_blueprint(user_profile_bp)
+app.register_blueprint(user_account_lifecycle_bp)
 app.register_blueprint(user_social_bp)
 app.register_blueprint(user_referral_bp)
 app.register_blueprint(posts_bp)

@@ -1,9 +1,10 @@
 # services/user/profile_service.py
 from dependencies import db
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 import logging
-import requests
-from flask import jsonify
+from datetime import datetime
+from flask import jsonify, request
+from firebase_admin import firestore
 from services.content.category_service import CategoryService
 from services.recommendation.gorse_client import gorse_client
 
@@ -11,6 +12,105 @@ logger = logging.getLogger(__name__)
 
 class ProfileService:
     """Service for user profile operations"""
+
+    @staticmethod
+    def _resolve_username(user_data: Dict[str, Any], fallback: str = '') -> str:
+        username = (
+            user_data.get('username')
+            or user_data.get('Username')
+            or user_data.get('name')
+            or fallback
+        )
+        return str(username or '').strip()
+
+    @staticmethod
+    def _is_user_inactive(user_data: Dict[str, Any]) -> bool:
+        if not user_data:
+            return False
+        if user_data.get('is_deactivated') is True:
+            return True
+        if user_data.get('account_status') == 'deactivated':
+            return True
+        if user_data.get('deletionStatus') in {'pending_window', 'processing'}:
+            return True
+        return False
+
+    @staticmethod
+    def _get_user_name(user_id: str, user_type: str = 'human') -> str:
+        if not user_id:
+            return ''
+        try:
+            preferred_collection = 'aiUsers' if user_type == 'ai' else 'humanUsers'
+            doc = db.collection(preferred_collection).document(user_id).get()
+            if doc.exists:
+                return ProfileService._resolve_username(doc.to_dict() or {}, user_id)
+
+            alternate_collection = 'humanUsers' if preferred_collection == 'aiUsers' else 'aiUsers'
+            alt_doc = db.collection(alternate_collection).document(user_id).get()
+            if alt_doc.exists:
+                return ProfileService._resolve_username(alt_doc.to_dict() or {}, user_id)
+        except Exception:
+            pass
+        return user_id
+
+    @staticmethod
+    def _resolve_user_ref_and_doc(user_id: str, user_type: str) -> Tuple[Optional[Any], Optional[Any]]:
+        normalized_id = str(user_id or '').strip()
+        if not normalized_id:
+            return None, None
+
+        preferred_collection_name = 'aiUsers' if user_type == 'ai' else 'humanUsers'
+        fallback_collection_name = 'humanUsers' if preferred_collection_name == 'aiUsers' else 'aiUsers'
+
+        def _resolve_in_collection(collection_name: str) -> Tuple[Optional[Any], Optional[Any]]:
+            collection = db.collection(collection_name)
+
+            direct_ref = collection.document(normalized_id)
+            direct_doc = direct_ref.get()
+            if direct_doc.exists:
+                return direct_ref, direct_doc
+
+            for field_name in ['uid', 'id', 'userId', 'username', 'Username', 'name']:
+                try:
+                    matches = list(collection.where(field_name, '==', normalized_id).limit(1).stream())
+                    if matches:
+                        doc = matches[0]
+                        return doc.reference, doc
+                except Exception:
+                    continue
+
+            return None, None
+
+        ref, doc = _resolve_in_collection(preferred_collection_name)
+        if ref is not None and doc is not None:
+            return ref, doc
+
+        return _resolve_in_collection(fallback_collection_name)
+
+    @staticmethod
+    def _resolve_actor_identity(user_id: str) -> Tuple[Optional[Any], Optional[Any], str, str]:
+        ref, doc = ProfileService._resolve_user_ref_and_doc(user_id, 'human')
+        if ref is None or doc is None:
+            return None, None, 'human', ''
+
+        data = doc.to_dict() or {}
+        username = ProfileService._resolve_username(data, '').strip()
+        user_type = 'ai' if str(getattr(ref, 'path', '')).startswith('aiUsers/') else 'human'
+        return ref, doc, user_type, username
+
+    @staticmethod
+    def _resolve_likeable_post(post_id: str) -> Tuple[Optional[Any], Optional[Dict[str, Any]], Optional[str]]:
+        normalized_post_id = str(post_id or '').strip()
+        if not normalized_post_id:
+            return None, None, None
+
+        for collection_name in ['humanPosts', 'reposts']:
+            post_ref = db.collection(collection_name).document(normalized_post_id)
+            post_doc = post_ref.get()
+            if post_doc.exists:
+                return post_ref, post_doc.to_dict() or {}, collection_name
+
+        return None, None, None
 
     @staticmethod
     def create_profile(user_id: str, profile_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -523,6 +623,9 @@ class ProfileService:
                 return jsonify({"success": False, "error": "User not found"}), 404
 
             user_data = user_doc.to_dict()
+            if ProfileService._is_user_inactive(user_data):
+                return jsonify({"success": False, "error": "User not found"}), 404
+
             return jsonify({"success": True, "data": user_data}), 200
         except Exception as ex:
             logger.error("Error retrieving profile: %s", ex)
@@ -539,135 +642,140 @@ class ProfileService:
             following_type = data.get("FollowingType", "human")  # "human" or "ai"
             following_username = data.get("FollowingUserName")
 
-            # Determine the correct collections based on user types
-            follower_collection = 'aiUsers' if follower_type == 'ai' else 'humanUsers'
-            following_collection = 'aiUsers' if following_type == 'ai' else 'humanUsers'
+            follower_id = str(follower_id or '').strip()
+            following_id = str(following_id or '').strip()
+            follower_type = str(follower_type or 'human').strip().lower()
+            following_type = str(following_type or 'human').strip().lower()
 
-            # For AI users, the document ID is the username
-            follower_doc_id = follower_id
-            following_doc_id = following_id
+            if not follower_id or not following_id:
+                return jsonify({"success": False, "error": "FollowerId and FollowingId are required"}), 400
 
-            follower_ref = db.collection(follower_collection).document(follower_doc_id)
-            following_ref = db.collection(following_collection).document(following_doc_id)
+            if follower_type not in {'human', 'ai'}:
+                follower_type = 'human'
+            if following_type not in {'human', 'ai'}:
+                following_type = 'human'
 
-            follower_doc = follower_ref.get()
-            following_doc = following_ref.get()
+            if follower_id == following_id and follower_type == following_type:
+                return jsonify({"success": False, "error": "Cannot follow self"}), 400
 
-            if not follower_doc.exists or not following_doc.exists:
+            follower_ref, follower_doc = ProfileService._resolve_user_ref_and_doc(
+                follower_id,
+                follower_type,
+            )
+            following_ref, following_doc = ProfileService._resolve_user_ref_and_doc(
+                following_id,
+                following_type,
+            )
+
+            if follower_ref is None or following_ref is None or follower_doc is None or following_doc is None:
                 return jsonify({"success": False, "error": "User not found"}), 404
 
-            # Update the follower's following list
-            follower_data = follower_doc.to_dict()
+            follower_data = follower_doc.to_dict() or {}
+            following_data = following_doc.to_dict() or {}
+
+            if follower_type == 'human' and ProfileService._is_user_inactive(follower_data):
+                return jsonify({"success": False, "error": "Follower account is inactive"}), 403
+
+            if following_type == 'human' and ProfileService._is_user_inactive(following_data):
+                return jsonify({"success": False, "error": "Target account is inactive"}), 403
+
+            follower_username = ProfileService._resolve_username(follower_data, follower_id)
+            following_username = ProfileService._resolve_username(following_data, following_id)
+
             following_entry = {
                 "id": following_id,
                 "username": following_username,
                 "type": following_type
             }
-            
-            # Check if already following
-            current_following = follower_data.get("following", [])
-            already_following = False
-            for entry in current_following:
-                if isinstance(entry, dict) and entry.get("id") == following_id and entry.get("type") == following_type:
-                    already_following = True
-                    break
-                elif entry == following_id:  # Handle legacy format
-                    already_following = True
-                    break
-                    
-            if not already_following:
-                # Convert any legacy format to new format
-                new_following = []
-                for entry in current_following:
-                    if isinstance(entry, str):
-                        # Fetch the actual username for this user ID
-                        entry_username = get_user_name(entry)
-                        # Determine type by checking which collection the user is in
-                        entry_type = "human"
-                        try:
-                            if not db.collection('humanUsers').document(entry).get().exists:
-                                if db.collection('aiUsers').document(entry).get().exists:
-                                    entry_type = "ai"
-                        except:
-                            pass
-                        new_following.append({"id": entry, "username": entry_username, "type": entry_type})
-                    else:
-                        # Ensure existing entries have usernames
-                        if not entry.get("username"):
-                            entry["username"] = get_user_name(entry.get("id", ""))
-                        new_following.append(entry)
-                
-                new_following.append(following_entry)
-                follower_ref.update({
-                    "following": new_following,
-                    "following_count": firestore.Increment(1) if follower_collection == 'aiUsers' else len(new_following)
-                })
-
-            # Update the following user's followers list
-            following_data = following_doc.to_dict()
             follower_entry = {
                 "id": follower_id,
                 "username": follower_username,
                 "type": follower_type
             }
-            
-            # Check if already in followers
-            current_followers = following_data.get("followers", [])
-            already_follower = False
-            for entry in current_followers:
-                if isinstance(entry, dict) and entry.get("id") == follower_id and entry.get("type") == follower_type:
-                    already_follower = True
-                    break
-                elif entry == follower_id:  # Handle legacy format
-                    already_follower = True
-                    break
-                    
-            if not already_follower:
-                # Convert any legacy format to new format
-                new_followers = []
-                for entry in current_followers:
+
+            current_following = follower_data.get("following", []) or []
+            current_followers = following_data.get("followers", []) or []
+
+            def _normalize(entries, default_type="human"):
+                normalized = []
+                for entry in entries:
                     if isinstance(entry, str):
-                        # Fetch the actual username for this user ID
-                        entry_username = get_user_name(entry)
-                        # Determine type by checking which collection the user is in
-                        entry_type = "human"
+                        entry_type = default_type
                         try:
-                            if not db.collection('humanUsers').document(entry).get().exists:
-                                if db.collection('aiUsers').document(entry).get().exists:
-                                    entry_type = "ai"
-                        except:
+                            if not db.collection('humanUsers').document(entry).get().exists and db.collection('aiUsers').document(entry).get().exists:
+                                entry_type = "ai"
+                        except Exception:
                             pass
-                        new_followers.append({"id": entry, "username": entry_username, "type": entry_type})
-                    else:
-                        # Ensure existing entries have usernames
-                        if not entry.get("username"):
-                            entry["username"] = get_user_name(entry.get("id", ""))
-                        new_followers.append(entry)
-                
+                        normalized.append({
+                            "id": entry,
+                            "username": ProfileService._get_user_name(entry, entry_type),
+                            "type": entry_type,
+                        })
+                        continue
+
+                    if isinstance(entry, dict):
+                        entry_id = str(entry.get("id") or entry.get("uid") or entry.get("userId") or entry.get("_id") or "").strip()
+                        if not entry_id:
+                            continue
+                        entry_type = str(entry.get("type") or default_type)
+                        entry_username = entry.get("username") or ProfileService._get_user_name(entry_id, entry_type)
+                        normalized.append({
+                            "id": entry_id,
+                            "username": entry_username,
+                            "type": entry_type,
+                        })
+                        continue
+
+                return normalized
+
+            new_following = _normalize(current_following)
+            new_followers = _normalize(current_followers)
+
+            already_following = any(
+                isinstance(entry, dict)
+                and entry.get("id") == following_id
+                and str(entry.get("type", "human")) == following_type
+                for entry in new_following
+            )
+            if not already_following:
+                new_following.append(following_entry)
+
+            already_follower = any(
+                isinstance(entry, dict)
+                and entry.get("id") == follower_id
+                and str(entry.get("type", "human")) == follower_type
+                for entry in new_followers
+            )
+            if not already_follower:
                 new_followers.append(follower_entry)
-                following_ref.update({
-                    "followers": new_followers,
-                    "followers_count": firestore.Increment(1) if following_collection == 'aiUsers' else len(new_followers)
-                })
-                
-                # Create notification for the user being followed (only for human users)
-                if following_type == "human":
-                    try:
-                        # Use the notification event service to handle notifications properly
-                        # This respects quiet hours, user preferences, and digest system
-                        from services.notifications.event_service import NotificationEventService
-                        
-                        notification_event_data = {
-                            'followerId': follower_id,
-                            'followedUserId': following_id,
-                            'timestamp': datetime.utcnow().isoformat()
-                        }
-                        
-                        result, status_code = NotificationEventService.handle_user_follow(notification_event_data)
-                        logger.info(f"Follow notification event handled with status {status_code}")
-                        
-                    except Exception as e:
-                        logger.error(f"Error creating follow notification: {e}")
+
+            batch = db.batch()
+            batch.update(follower_ref, {
+                "following": new_following,
+                "following_count": firestore.Increment(1) if follower_type == 'ai' and not already_following else len(new_following)
+            })
+            batch.update(following_ref, {
+                "followers": new_followers,
+                "followers_count": firestore.Increment(1) if following_type == 'ai' and not already_follower else len(new_followers)
+            })
+            batch.commit()
+
+            # Create notification for the user being followed (only for human users)
+            if following_type == "human" and not already_follower:
+                try:
+                    from services.notifications.event_service import NotificationEventService
+
+                    notification_event_data = {
+                        'followerId': follower_id,
+                        'followedUserId': following_id,
+                        'timestamp': datetime.utcnow().isoformat()
+                    }
+
+                    result, status_code = NotificationEventService.handle_user_follow(notification_event_data)
+                    logger.info(f"Follow notification event handled with status {status_code}")
+
+                except Exception as e:
+                    logger.error(f"Error creating follow notification: {e}")
 
             return jsonify({"success": True}), 200
         except Exception as ex:
@@ -681,25 +789,31 @@ class ProfileService:
             follower_id = data.get("FollowerId")  # A (authenticated user)
             following_id = data.get("FollowingId")  # B (user to follow)
             follower_type = data.get("FollowerType", "human")  # "human" or "ai"
-            follower_username = data.get("FollowerUserName")
             following_type = data.get("FollowingType", "human")  # "human" or "ai"
-            follower_username = data.get("FollowingUserName")
 
-            # Determine the correct collections based on user types
-            follower_collection = 'aiUsers' if follower_type == 'ai' else 'humanUsers'
-            following_collection = 'aiUsers' if following_type == 'ai' else 'humanUsers'
+            follower_id = str(follower_id or '').strip()
+            following_id = str(following_id or '').strip()
+            follower_type = str(follower_type or 'human').strip().lower()
+            following_type = str(following_type or 'human').strip().lower()
 
-            # For AI users, the document ID is the username
-            follower_doc_id = follower_id
-            following_doc_id = following_id
+            if not follower_id or not following_id:
+                return jsonify({"success": False, "error": "FollowerId and FollowingId are required"}), 400
 
-            follower_ref = db.collection(follower_collection).document(follower_doc_id)
-            following_ref = db.collection(following_collection).document(following_doc_id)
+            if follower_type not in {'human', 'ai'}:
+                follower_type = 'human'
+            if following_type not in {'human', 'ai'}:
+                following_type = 'human'
 
-            follower_doc = follower_ref.get()
-            following_doc = following_ref.get()
+            follower_ref, follower_doc = ProfileService._resolve_user_ref_and_doc(
+                follower_id,
+                follower_type,
+            )
+            following_ref, following_doc = ProfileService._resolve_user_ref_and_doc(
+                following_id,
+                following_type,
+            )
 
-            if not follower_doc.exists or not following_doc.exists:
+            if follower_ref is None or following_ref is None or follower_doc is None or following_doc is None:
                 return jsonify({"success": False, "error": "User not found"}), 404
 
             # Update the follower's following list
@@ -720,7 +834,7 @@ class ProfileService:
             if removed:
                 follower_ref.update({
                     "following": new_following,
-                    "following_count": firestore.Increment(-1) if follower_collection == 'aiUsers' else len(new_following)
+                    "following_count": firestore.Increment(-1) if follower_type == 'ai' else len(new_following)
                 })
 
             # Update the following user's followers list
@@ -741,7 +855,7 @@ class ProfileService:
             if removed:
                 following_ref.update({
                     "followers": new_followers,
-                    "followers_count": firestore.Increment(-1) if following_collection == 'aiUsers' else len(new_followers)
+                    "followers_count": firestore.Increment(-1) if following_type == 'ai' else len(new_followers)
                 })
 
             return jsonify({"success": True}), 200
@@ -917,69 +1031,95 @@ class ProfileService:
             user_id = data.get("UserId")
             post_id = data.get("PostId")
 
-            # Get post details to find the author
-            post_doc = db.collection('humanPosts').document(post_id).get()
-            if not post_doc.exists:
+            if not user_id or not post_id:
+                return jsonify({"success": False, "error": "UserId and PostId are required"}), 400
+
+            actor_ref, actor_doc, actor_type, actor_username = ProfileService._resolve_actor_identity(user_id)
+            if actor_ref is None or actor_doc is None:
+                return jsonify({"success": False, "error": "User not found"}), 404
+            if not actor_username:
+                return jsonify({"success": False, "error": "User username is missing"}), 400
+
+            actor_id = str(getattr(actor_ref, 'id', '') or '').strip()
+            request_user_id = str(user_id or '').strip()
+            if not actor_id:
+                return jsonify({"success": False, "error": "Resolved user id is missing"}), 400
+
+            post_ref, post_data, post_collection = ProfileService._resolve_likeable_post(post_id)
+            if post_ref is None or post_data is None or post_collection is None:
                 return jsonify({"success": False, "error": "Post not found"}), 404
-            
-            post_data = post_doc.to_dict()
-            post_author_id = post_data.get('author_id')
+
+            post_author_id = (
+                post_data.get('author_id')
+                or post_data.get('user_document_id')
+                or post_data.get('user_id')
+            )
 
             like_data = {
-                "user_id": user_id,
+                "user_id": actor_id,
                 "post_id": post_id,
+                "post_collection": post_collection,
                 "timestamp": firestore.SERVER_TIMESTAMP
             }
 
-            # Increment the like count in the posts collection
-            post_ref = db.collection('humanPosts').document(post_id)
+            # Increment the like count in the post collection
             post_ref.update({
                 "likes": firestore.Increment(1)
             })
 
             # Update the liked_posts field in humanUsers collection
-            user_ref = db.collection('humanUsers').document(user_id)
-            user_ref.update({
-                "liked_posts": firestore.ArrayUnion([post_id])
-            })
+            if actor_type == 'human':
+                actor_ref.update({
+                    "liked_posts": firestore.ArrayUnion([post_id])
+                })
 
             # Trigger engagement notification if post author is different
             # if post_author_id and post_author_id != user_id:
 
-            # Build like entry (id, username, type)
-            try:
-                user_doc = user_ref.get()
-                username = ''
-                if user_doc.exists:
-                    username = user_doc.to_dict().get('username', '') or user_doc.to_dict().get('name', '')
-            except Exception:
-                username = ''
-
             like_entry = {
-                'id': user_id,
-                'username': username,
-                'type': 'human'
+                'id': actor_id,
+                'username': actor_username,
+                'type': actor_type
             }
 
             # Use transaction to add likedBy entry only if not already present
             did_add_like = False
             try:
-                def _add_like_transaction(transaction, ref, entry, uid):
+                def _add_like_transaction(transaction, ref, entry, uid, legacy_uid):
                     snap = ref.get(transaction=transaction)
                     if not snap.exists:
                         transaction.set(ref, {'likedBy': [entry]}, merge=True)
                         return True
                     data = snap.to_dict() or {}
                     liked_by = list(data.get('likedBy', []))
-                    exists = any((isinstance(e, dict) and e.get('id') == uid) for e in liked_by)
+                    exists = False
+                    updated = False
+                    match_ids = {str(uid), str(legacy_uid)}
+                    for index, existing in enumerate(liked_by):
+                        if isinstance(existing, dict) and str(existing.get('id') or '') in match_ids:
+                            exists = True
+                            normalized_existing = dict(existing)
+                            if str(normalized_existing.get('id') or '').strip() != entry.get('id'):
+                                normalized_existing['id'] = entry.get('id')
+                                updated = True
+                            if (normalized_existing.get('username') or '').strip() != entry.get('username'):
+                                normalized_existing['username'] = entry.get('username')
+                                updated = True
+                            if (normalized_existing.get('type') or '').strip() != entry.get('type'):
+                                normalized_existing['type'] = entry.get('type')
+                                updated = True
+                            if updated:
+                                liked_by[index] = normalized_existing
+                            break
                     if not exists:
                         liked_by.append(entry)
+                        updated = True
+                    if updated:
                         transaction.update(ref, {'likedBy': liked_by})
-                        return True
-                    return False
+                    return not exists
 
                 transaction = db.transaction()
-                did_add_like = _add_like_transaction(transaction, post_ref, like_entry, user_id)
+                did_add_like = _add_like_transaction(transaction, post_ref, like_entry, actor_id, request_user_id)
             except Exception as e:
                 # Fall back: try a simple update with arrayUnion (best-effort)
                 try:
@@ -991,19 +1131,19 @@ class ProfileService:
             # Record interaction in Gorse
             if did_add_like:
                 try:
-                    gorse_client.record_interaction(user_id, post_id, 'like')
-                    print(f"💚 GORSE SYNC: Recorded like - user={user_id[:15]}..., post={post_id[:15]}...")
+                    gorse_client.record_interaction(actor_id, post_id, 'like')
+                    print(f"💚 GORSE SYNC: Recorded like - user={actor_id[:15]}..., post={post_id[:15]}...")
                 except Exception as e:
                     print(f"⚠️  Failed to record like in Gorse: {e}")
             
             # Trigger engagement notification if post author is different and like was actually added
-            if did_add_like and post_author_id and post_author_id != user_id:
+            if did_add_like and post_author_id and post_author_id != actor_id:
                 try:
                     import requests
                     notification_data = {
                         'postId': post_id,
                         'type': 'like',
-                        'userId': user_id,
+                        'userId': actor_id,
                         'postAuthorId': post_author_id,
                         'timestamp': datetime.utcnow().isoformat()
                     }
@@ -1023,16 +1163,31 @@ class ProfileService:
             user_id = data.get("UserId")
             post_id = data.get("PostId")
 
+            if not user_id or not post_id:
+                return jsonify({"success": False, "error": "UserId and PostId are required"}), 400
+
+            actor_ref, actor_doc, actor_type, _ = ProfileService._resolve_actor_identity(user_id)
+            if actor_ref is None or actor_doc is None:
+                return jsonify({"success": False, "error": "User not found"}), 404
+
+            actor_id = str(getattr(actor_ref, 'id', '') or '').strip()
+            request_user_id = str(user_id or '').strip()
+            if not actor_id:
+                return jsonify({"success": False, "error": "Resolved user id is missing"}), 400
+
+            post_ref, _, post_collection = ProfileService._resolve_likeable_post(post_id)
+            if post_ref is None or post_collection is None:
+                return jsonify({"success": False, "error": "Post not found"}), 404
+
             # Query to find the like relationship
-            query = db.collection('postLikes').where('user_id', '==', user_id).where('post_id', '==', post_id)
+            query = db.collection('postLikes').where('user_id', '==', actor_id).where('post_id', '==', post_id)
             snapshot = query.stream()
 
             # Remove the like relationship
             for doc in snapshot:
                 doc.reference.delete()
 
-            # Decrement the like count in the posts collection
-            post_ref = db.collection('humanPosts').document(post_id)
+            # Decrement the like count in the post collection
             try:
                 post_ref.update({
                     "likes": firestore.Increment(-1)
@@ -1041,10 +1196,10 @@ class ProfileService:
                 pass
 
             # Update the liked_posts field in humanUsers collection
-            user_ref = db.collection('humanUsers').document(user_id)
-            user_ref.update({
-                "liked_posts": firestore.ArrayRemove([post_id])
-            })
+            if actor_type == 'human':
+                actor_ref.update({
+                    "liked_posts": firestore.ArrayRemove([post_id])
+                })
 
             # Remove from post's likedBy array (match by id)
             try:
@@ -1052,7 +1207,11 @@ class ProfileService:
                 if snap.exists:
                     data = snap.to_dict() or {}
                     liked_by = list(data.get('likedBy', []))
-                    updated = [e for e in liked_by if not (isinstance(e, dict) and e.get('id') == user_id)]
+                    match_ids = {actor_id, request_user_id}
+                    updated = [
+                        e for e in liked_by
+                        if not (isinstance(e, dict) and str(e.get('id') or '') in match_ids)
+                    ]
                     post_ref.update({'likedBy': updated})
             except Exception as e:
                 logger.error(f"Error removing likedBy entry for post {post_id}: {e}")

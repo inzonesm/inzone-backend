@@ -99,14 +99,31 @@ class FeedService:
             if not data or not data.get("Post"):
                 return jsonify({"success": False, "error": "Post content is required", "code": "INVALID_POST_CONTENT"}), 400
 
-            username = data.get("UserName")
-            if not username:
-                return jsonify({"success": False, "error": "Username is required", "code": "INVALID_USERNAME"}), 400
-
             post_text = data.get("Post").get("TextContent", "")
             image_content = data.get("Post").get("ImageContent", [])
             video_content = data.get("Post").get("VideoContent", [])
             user_document_id = data.get("UserDocumentId")
+
+            if not user_document_id:
+                return jsonify({"success": False, "error": "UserDocumentId is required", "code": "INVALID_USER_ID"}), 400
+
+            user_doc = db.collection('humanUsers').document(user_document_id).get()
+            if not user_doc.exists:
+                return jsonify({"success": False, "error": "User not found", "code": "USER_NOT_FOUND"}), 404
+
+            user_data = user_doc.to_dict() or {}
+            username = str(user_data.get('username') or '').strip()
+            if not username:
+                return jsonify({"success": False, "error": "User username is missing", "code": "MISSING_USERNAME"}), 400
+
+            request_username = str(data.get("UserName") or '').strip()
+            if request_username and request_username != username:
+                logger.warning(
+                    "[CREATE_HUMAN_POST] Ignoring mismatched request username '%s' for user %s; using canonical '%s'",
+                    request_username,
+                    user_document_id,
+                    username,
+                )
 
             logger.info(f"[CREATE_HUMAN_POST] Post text: {post_text[:60]}...")
             logger.info(f"[CREATE_HUMAN_POST] Images: {len(image_content)}, Videos: {len(video_content)}")
@@ -919,6 +936,7 @@ class FeedService:
             human_posts_all = [
                 post for post in human_posts_all
                 if post.get('content') != '[This post has been deleted by the user]'
+                and post.get('deactivated') is not True
             ]
 
             human_count = len(human_posts_all)
@@ -935,6 +953,7 @@ class FeedService:
             reposts_all = [
                 post for post in reposts_all
                 if post.get('content') != '[This post has been deleted by the user]'
+                and post.get('deactivated') is not True
             ]
 
             print(f"Total posts fetched - AI: {len(ai_posts_all)}, Human: {len(human_posts_all)}, Reposts: {len(reposts_all)}")
@@ -1314,6 +1333,7 @@ class FeedService:
             posts = [
                 post for post in posts
                 if post.get('content') != '[This post has been deleted by the user]'
+                and post.get('deactivated') is not True
             ]
 
             posts.sort(key=lambda x: x['date_posted'], reverse=True)

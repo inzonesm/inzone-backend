@@ -79,8 +79,7 @@ def update_interests():
 @user_profile_bp.route('/user/get-profile', methods=['GET'])
 def get_profile():
     try:
-        data = request.get_json()
-        return ProfileService.get_profile(data)
+        return ProfileService.get_profile({})
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
@@ -199,8 +198,7 @@ def grant_referral_rewards(referrer_id, referee_id):
 @user_profile_bp.route('/user/referral-stats', methods=['GET'])
 def get_referral_stats():
     try:
-        data = request.get_json()
-        return ProfileService.get_referral_stats(data)
+        return ProfileService.get_referral_stats({})
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:

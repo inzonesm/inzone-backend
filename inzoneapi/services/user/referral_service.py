@@ -15,27 +15,21 @@ class ReferralService:
 	def track_accepted_referral(data: Dict[str, Any]):
 		try:
 			referrer_id = data.get('ReferrerId') or data.get('referrerId')
-			referee_id = (
-				data.get('RefereeId')
-				or data.get('refereeId')
-				or data.get('InstallerId')
-				or data.get('installerId')
-				or data.get('UserDocumentId')
-			)
+			installer_id = data.get('InstallerId') or data.get('installerId')
 
-			if not referrer_id or not referee_id:
+			if not referrer_id or not installer_id:
 				return jsonify({
 					'success': False,
-					'error': 'ReferrerId and RefereeId are required',
+					'error': 'ReferrerId and InstallerId are required',
 				}), 400
 
-			if referrer_id == referee_id:
+			if referrer_id == installer_id:
 				return jsonify({
 					'success': False,
 					'error': 'Referrer and referee cannot be the same user',
 				}), 400
 
-			profile = ReferralService._load_human_user_profile(referee_id)
+			profile = ReferralService._load_human_user_profile(installer_id)
 			installer_display_name = (
 				data.get('InstallerDisplayName')
 				or data.get('installerDisplayName')
@@ -54,34 +48,54 @@ class ReferralService:
 				or profile.get('profile_picture_url')
 			)
 
-			existing_query = (
-				db.collection('referrals')
-				.where('referrerId', '==', referrer_id)
-				.where('installerId', '==', referee_id)
-				.limit(1)
-				.get()
-			)
-			if existing_query:
-				if installer_display_name or installer_photo_url:
-					existing_ref = existing_query[0].reference
-					update_payload = {}
-					if installer_display_name:
-						update_payload['installerDisplayName'] = installer_display_name
-					if installer_photo_url:
-						update_payload['installerPhotoURL'] = installer_photo_url
-					if update_payload:
-						existing_ref.set(update_payload, merge=True)
-				existing_id = existing_query[0].id
+			referral_doc_id = ReferralService._build_referral_doc_id(referrer_id, installer_id)
+
+			existing_doc = db.collection('referrals').document(referral_doc_id).get()
+			if existing_doc.exists:
+				update_payload = {
+					'referrerId': referrer_id,
+					'installerId': installer_id,
+					'referralKey': referral_doc_id,
+				}
+				if installer_display_name:
+					update_payload['installerDisplayName'] = installer_display_name
+				if installer_photo_url:
+					update_payload['installerPhotoURL'] = installer_photo_url
+				existing_doc.reference.set(update_payload, merge=True)
 				return jsonify({
 					'success': True,
 					'message': 'Referral already tracked',
-					'data': {'referral_id': existing_id, 'already_exists': True},
+					'data': {'referral_id': existing_doc.id, 'already_exists': True},
+				}), 200
+
+			existing_legacy_doc = ReferralService._find_existing_referral_doc(referrer_id, installer_id)
+			if existing_legacy_doc is not None:
+				update_payload = {
+					'referrerId': referrer_id,
+					'installerId': installer_id,
+					'referralKey': referral_doc_id,
+				}
+				if installer_display_name:
+					update_payload['installerDisplayName'] = installer_display_name
+				if installer_photo_url:
+					update_payload['installerPhotoURL'] = installer_photo_url
+				existing_legacy_doc.reference.set(update_payload, merge=True)
+
+				db.collection('referrals').document(referral_doc_id).set(
+					{**(existing_legacy_doc.to_dict() or {}), **update_payload},
+					merge=True,
+				)
+
+				return jsonify({
+					'success': True,
+					'message': 'Referral already tracked',
+					'data': {'referral_id': referral_doc_id, 'already_exists': True},
 				}), 200
 
 			referral_data = {
+				'referralKey': referral_doc_id,
 				'referrerId': referrer_id,
-				'installerId': referee_id,
-				'referee_id': referee_id,
+				'installerId': installer_id,
 				'installerDisplayName': installer_display_name,
 				'installerPhotoURL': installer_photo_url,
 				'status': 'accepted',
@@ -92,13 +106,13 @@ class ReferralService:
 				'accepted_at': firestore.SERVER_TIMESTAMP,
 			}
 
-			ref_doc = db.collection('referrals').document()
+			ref_doc = db.collection('referrals').document(referral_doc_id)
 			ref_doc.set(referral_data)
 
-			referee_ref = db.collection('humanUsers').document(referee_id)
-			referee_doc = referee_ref.get()
-			if referee_doc.exists:
-				referee_ref.set({'referred_by': referrer_id}, merge=True)
+			installer_ref = db.collection('humanUsers').document(installer_id)
+			installer_doc = installer_ref.get()
+			if installer_doc.exists:
+				installer_ref.set({'referred_by': referrer_id}, merge=True)
 
 			db.collection('humanUsers').document(referrer_id).set({
 				'referral_count': firestore.Increment(1),
@@ -167,25 +181,39 @@ class ReferralService:
 			profile_cache: Dict[str, Dict[str, Any]] = {}
 
 			items = []
-			for item in refs[:safe_limit]:
-				installer_id = item.get('installerId') or item.get('referee_id')
+			seen_installers = set()
+			for item in refs:
+				installer_id = ReferralService._resolve_installer_id(item)
+				if installer_id:
+					installer_key = str(installer_id)
+					if installer_key in seen_installers:
+						continue
+					seen_installers.add(installer_key)
 				display_name = (
 					item.get('installerDisplayName')
+					or item.get('installer_display_name')
+					or item.get('name')
 				)
-				photo_url = item.get('installerPhotoURL') or item.get('photo_url') or ''
+				photo_url = (
+					item.get('installerPhotoURL')
+					or item.get('installer_photo_url')
+					or item.get('photo_url')
+					or ''
+				)
 				ts = item.get('installTimestamp') or item.get('accepted_at') or item.get('date_created')
 
 				if installer_id and (not display_name or not str(display_name).strip()):
-					profile = profile_cache.get(installer_id)
+					profile = profile_cache.get(str(installer_id))
 					if profile is None:
-						profile = ReferralService._load_human_user_profile(installer_id)
-						profile_cache[installer_id] = profile
+						profile = ReferralService._load_human_user_profile(str(installer_id))
+						profile_cache[str(installer_id)] = profile
 
 					display_name = (
 						profile.get('name')
 						or profile.get('Name')
 						or profile.get('username')
 						or profile.get('Username')
+						or ReferralService._email_local_part(item.get('installerEmail') or profile.get('email'))
 						or display_name
 					)
 
@@ -210,12 +238,14 @@ class ReferralService:
 				items.append({
 					'id': item.get('_id'),
 					'referee_id': installer_id,
-					'name': display_name,
+					'name': display_name or 'User',
 					'photo_url': photo_url,
 					'date': ReferralService._to_iso8601(ts),
 					'status': item.get('status') or 'accepted',
 					'source': item.get('source') or 'referrals',
 				})
+
+			items = items[:safe_limit]
 
 			return jsonify({
 				'success': True,
@@ -245,3 +275,34 @@ class ReferralService:
 		except Exception as e:
 			logger.warning('Unable to load humanUsers profile for %s: %s', user_id, e)
 		return {}
+
+	@staticmethod
+	def _resolve_installer_id(item: Dict[str, Any]) -> str:
+		installer_id = item.get('installerId')
+		return str(installer_id) if installer_id else ''
+
+	@staticmethod
+	def _email_local_part(email: Any) -> str:
+		if not email:
+			return ''
+		value = str(email).strip()
+		if not value:
+			return ''
+		if '@' in value:
+			local = value.split('@', 1)[0].strip()
+			return local or value
+		return value
+
+	@staticmethod
+	def _build_referral_doc_id(referrer_id: str, referee_id: str) -> str:
+		return f'{referrer_id}_{referee_id}'
+
+	@staticmethod
+	def _find_existing_referral_doc(referrer_id: str, referee_id: str):
+		for doc in db.collection('referrals').where('referrerId', '==', referrer_id).stream():
+			payload = doc.to_dict() or {}
+			installer_id = payload.get('installerId')
+			if str(installer_id or '') == referee_id:
+				return doc
+
+		return None
