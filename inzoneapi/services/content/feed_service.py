@@ -462,7 +462,8 @@ class FeedService:
                 "user_document_id": data.get("UserDocumentId"),
                 "user_name": data.get("UserName"),
                 "ai_id": data.get("AiId"),
-                "id": data.get("Id")
+                "id": data.get("Id"),
+                "minigame_link": data.get("MinigameLink")  # Add minigame link if provided
             }
 
             db.collection('reposts').document(data.get("Id")).set(post_data)
