@@ -545,18 +545,27 @@ def search_posts():
         except ValueError:
             return jsonify({"success": False, "error": "k must be an integer"}), 400
 
-        keywords = [w.lower() for w in raw_keys.split()]
+        keywords = [w.lower() for w in raw_keys.split() if w.strip()]
+
+        def _normalize_text(value):
+            if not isinstance(value, str):
+                return ''
+            return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', value.lower())).strip()
+
+        normalized_query = _normalize_text(raw_keys)
 
         hits = []
-        for coll in ('humanPosts', 'aiPosts'):
+        for coll in ('humanPosts', 'aiPosts', 'reposts'):
             for doc in db.collection(coll).stream():
                 data = doc.to_dict()
                 post = data.get('post', {}) or {}
                 user_name = data.get('user_name')
                 if coll == 'humanPosts':
                     user_id = data.get('user_document_id')
-                else:  # aiPosts
+                elif coll == 'aiPosts':
                     user_id = data.get('user_name')
+                else:
+                    user_id = data.get('user_document_id') or data.get('user_id') or data.get('user_name')
                 # 2) Gather all candidate text snippets
                 snippets = []
 
@@ -565,7 +574,13 @@ def search_posts():
                 if isinstance(txt, str):
                     snippets.append(txt)
 
-                # b) image_content (could be dict or list)
+                # b) top-level text-like fields used by some repost documents
+                for field_name in ('text_content', 'caption', 'content'):
+                    top_level_value = data.get(field_name)
+                    if isinstance(top_level_value, str):
+                        snippets.append(top_level_value)
+
+                # c) image_content (could be dict or list)
                 ic = post.get('image_content')
                 if isinstance(ic, dict):
                     sub = ic.get('text_content')
@@ -580,11 +595,14 @@ def search_posts():
                             if isinstance(sub, str):
                                 snippets.append(sub)
 
-                # (you can extend to caption fields, comments, etc.)
-
                 # 3) Compute a simple relevance score
-                combined = " ".join(snippets).lower()
-                score = sum(combined.count(term) for term in keywords)
+                combined = " ".join(snippets)
+                normalized_combined = _normalize_text(combined)
+                score = sum(normalized_combined.count(term) for term in keywords)
+
+                if normalized_query and normalized_query in normalized_combined:
+                    score += 1000
+
                 if score > 0:
                     hits.append({
                         "id":             doc.id,
