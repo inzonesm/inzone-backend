@@ -9,6 +9,13 @@ def _error_response(code: str, message: str, status: int):
     return jsonify({"success": False, "error": message, "code": code}), status
 
 
+def _attach_game_key(data: dict) -> dict:
+    game_key = request.headers.get("X-Game-Key") or request.headers.get("x-game-key")
+    if game_key and isinstance(data, dict):
+        data.setdefault("gameKey", game_key)
+    return data
+
+
 @game_sdk_bp.route("/api/game-sdk/open-social-screen", methods=["GET", "POST"])
 def open_social_screen():
     try:
@@ -68,6 +75,7 @@ def open_chat():
 def dashboard():
     try:
         data = request.args.to_dict()
+        data = _attach_game_key(data)
         return SocialLoopService.dashboard(data)
     except ValueError as exc:
         return _error_response("INVALID_REQUEST", str(exc), 400)
@@ -79,6 +87,7 @@ def dashboard():
 def tier_10():
     try:
         data = request.get_json(silent=True) or {}
+        data = _attach_game_key(data)
         return SocialLoopService.purchase_coin_tier(data, 10)
     except ValueError as exc:
         return _error_response("INVALID_REQUEST", str(exc), 400)
@@ -90,6 +99,7 @@ def tier_10():
 def tier_50():
     try:
         data = request.get_json(silent=True) or {}
+        data = _attach_game_key(data)
         return SocialLoopService.purchase_coin_tier(data, 50)
     except ValueError as exc:
         return _error_response("INVALID_REQUEST", str(exc), 400)
@@ -101,6 +111,7 @@ def tier_50():
 def tier_150():
     try:
         data = request.get_json(silent=True) or {}
+        data = _attach_game_key(data)
         return SocialLoopService.purchase_coin_tier(data, 150)
     except ValueError as exc:
         return _error_response("INVALID_REQUEST", str(exc), 400)
@@ -112,7 +123,31 @@ def tier_150():
 def tier_400():
     try:
         data = request.get_json(silent=True) or {}
+        data = _attach_game_key(data)
         return SocialLoopService.purchase_coin_tier(data, 400)
+    except ValueError as exc:
+        return _error_response("INVALID_REQUEST", str(exc), 400)
+    except Exception:
+        return _error_response("INTERNAL_ERROR", "Internal server error", 500)
+
+
+@game_sdk_bp.route("/api/game-sdk/game-state", methods=["GET"])
+def game_state():
+    try:
+        data = request.args.to_dict()
+        data = _attach_game_key(data)
+        return SocialLoopService.game_state(data)
+    except ValueError as exc:
+        return _error_response("INVALID_REQUEST", str(exc), 400)
+    except Exception:
+        return _error_response("INTERNAL_ERROR", "Internal server error", 500)
+
+
+@game_sdk_bp.route("/api/game-sdk/games/register", methods=["POST"])
+def register_games():
+    try:
+        data = request.get_json(silent=True) or {}
+        return SocialLoopService.register_games(data)
     except ValueError as exc:
         return _error_response("INVALID_REQUEST", str(exc), 400)
     except Exception:

@@ -5,6 +5,7 @@ This contract is for game developers integrating HTML placeholders today and Uni
 ## Quick Navigation
 
 - [Base Path](#base-path)
+- [Security](#security)
 - [Gameplay Endpoints](#gameplay-endpoints)
 - [Coin Commerce](#coin-commerce)
 - [Dashboard](#dashboard)
@@ -16,6 +17,18 @@ This contract is for game developers integrating HTML placeholders today and Uni
 All endpoints live under:
 
 `/api/game-sdk`
+
+## Security
+
+Each game developer is issued a `gameKey`. Include it in the request header:
+
+`X-Game-Key: <your-game-key>`
+
+Required for:
+
+- `GET /api/game-sdk/game-state`
+- `POST /api/game-sdk/coins/*`
+- `GET /api/game-sdk/dashboard`
 
 ## Gameplay Endpoints
 
@@ -43,9 +56,29 @@ The response includes:
 - `screen` title + subtitle
 - `economy` coin tiers + commission rate
 - `actions` for all gameplay, coin, and dashboard endpoints
-            
 
-### 2. Post Score
+### 2. Game State
+
+`GET` `/api/game-sdk/game-state`
+
+Fetches a player's balance, previous transactions, and previous scores.
+
+Headers:
+
+`X-Game-Key: <your-game-key>`
+
+Query parameters:
+
+- `gameId` required
+- `userId` required
+
+Example request:
+
+```text
+/api/game-sdk/game-state?gameId=post-session&userId=user_42
+```
+
+### 3. Post Score
 
 `POST` `/api/game-sdk/post-score`
 
@@ -66,7 +99,7 @@ Example request:
 }
 ```
 
-### 3. Send Challenge
+### 4. Send Challenge
 
 `POST` `/api/game-sdk/send-challenge`
 
@@ -85,7 +118,7 @@ Example request:
 }
 ```
 
-### 4. Share Card
+### 5. Share Card
 
 `POST` `/api/game-sdk/share-card`
 
@@ -104,7 +137,7 @@ Example request:
 }
 ```
 
-### 5. Open Chat
+### 6. Open Chat
 
 `POST` `/api/game-sdk/open-chat`
 
@@ -128,6 +161,10 @@ Example request:
 ## Coin Commerce
 
 These endpoints are the in-game payment hooks for Unity and HTML games. Each one is a fixed-value purchase and requires the same three core fields: `userId`, `gameId`, and a human-readable `title` for the transaction.
+
+Security header required:
+
+`X-Game-Key: <your-game-key>`
 
 Game Developers Receive a 90% cut from any microtransaction
 
@@ -186,6 +223,10 @@ Every tier endpoint returns `data` with:
 
 `GET` `/api/game-sdk/dashboard`
 
+Headers:
+
+`X-Game-Key: <your-game-key>`
+
 Query parameters:
 
 - `gameId` required
@@ -218,13 +259,12 @@ Use `userId` when you want a player-scoped dashboard view.
 - `MISSING_GAME_OR_THREAD`
 - `INVALID_COIN_TIER`
 - `INSUFFICIENT_BALANCE`
+- `MISSING_GAME_KEY`
+- `INVALID_GAME_KEY`
+- `GAME_NOT_REGISTERED`
 - `USER_NOT_FOUND`
 - `INVALID_REQUEST`
 - `INTERNAL_ERROR`
-
-
-## Rate Limits
--- REMOVED: Rate limits are not enforced by the SDK endpoints.
 
 ## Response Shape
 

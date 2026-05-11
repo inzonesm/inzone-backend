@@ -43,6 +43,8 @@ COIN_TIERS: Dict[int, Dict[str, Any]] = {
 }
 
 GAME_SDK_BASE_PATH = "/api/game-sdk"
+GAME_REGISTRY_COLLECTION = "game_registry"
+GAME_DEVELOPERS_COLLECTION = "game_developers"
 
 
 
@@ -120,6 +122,33 @@ def _error_response(
     if details is not None:
         payload["details"] = details
     return jsonify(payload), status
+
+
+def _require_game_key(game_id: str, game_key: str):
+    if not game_id:
+        return _error_response("MISSING_GAME_ID", "gameId is required", 400)
+    if not game_key:
+        return _error_response("MISSING_GAME_KEY", "gameKey is required", 401)
+
+    game_doc = db.collection(GAME_REGISTRY_COLLECTION).document(game_id).get()
+    if not game_doc.exists:
+        return _error_response("GAME_NOT_REGISTERED", "Game not registered", 404)
+
+    game_data = game_doc.to_dict() or {}
+    stored_key = _normalize_string(game_data.get("game_key") or game_data.get("gameKey"))
+    developer_id = _normalize_string(game_data.get("developer_id") or game_data.get("developerId"))
+
+    if not stored_key and developer_id:
+        developer_doc = db.collection(GAME_DEVELOPERS_COLLECTION).document(developer_id).get()
+        if developer_doc.exists:
+            developer_data = developer_doc.to_dict() or {}
+            stored_key = _normalize_string(
+                developer_data.get("game_key") or developer_data.get("gameKey")
+            )
+
+    if not stored_key or stored_key != game_key:
+        return _error_response("INVALID_GAME_KEY", "Invalid gameKey", 403)
+    return None
 
 
 def _to_utc_datetime(value: Any) -> Optional[datetime]:
@@ -467,6 +496,85 @@ def _build_dashboard_summary(game_id: str, user_id: str = "") -> tuple:
     return jsonify(payload), 200
 
 
+def _build_game_state(game_id: str, user_id: str, game_key: str) -> tuple:
+    if not user_id:
+        return _error_response("MISSING_USER_ID", "userId is required", 400)
+
+    key_error = _require_game_key(game_id, game_key)
+    if key_error is not None:
+        return key_error
+
+    user_ref = db.collection("humanUsers").document(user_id)
+    user_doc = user_ref.get()
+    if not user_doc.exists:
+        return _error_response("USER_NOT_FOUND", "User not found", 404)
+
+    user_data = user_doc.to_dict() or {}
+    balance = int(user_data.get("balance", 0))
+
+    transactions_query = (
+        db.collection("game_coin_transactions")
+        .where("game_id", "==", game_id)
+        .where("user_id", "==", user_id)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(50)
+    )
+
+    transactions: List[Dict[str, Any]] = []
+    for doc in transactions_query.stream():
+        data = doc.to_dict() or {}
+        transactions.append(
+            {
+                "transactionId": doc.id,
+                "title": data.get("title"),
+                "description": data.get("description"),
+                "coins": int(data.get("coins", 0)),
+                "commissionCoins": int(data.get("commission_coins", 0)),
+                "developerCoins": int(data.get("developer_coins", 0)),
+                "status": data.get("status", "confirmed"),
+                "createdAt": data.get("created_at_local") or _utc_now(),
+            }
+        )
+
+    scores_query = (
+        db.collection("minigame_scores")
+        .where("game_id", "==", game_id)
+        .where("player_id", "==", user_id)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(50)
+    )
+
+    scores: List[Dict[str, Any]] = []
+    for doc in scores_query.stream():
+        data = doc.to_dict() or {}
+        scores.append(
+            {
+                "scoreId": doc.id,
+                "score": _format_number(data.get("score")),
+                "durationMs": _format_number(data.get("duration_ms")),
+                "displayName": data.get("display_name"),
+                "createdAt": data.get("created_at") or data.get("created_at_local") or _utc_now(),
+            }
+        )
+
+    return (
+        jsonify(
+            {
+                "success": True,
+                "data": {
+                    "gameId": game_id,
+                    "userId": user_id,
+                    "balance": balance,
+                    "currency": "Coin",
+                    "transactions": transactions,
+                    "scores": scores,
+                },
+            }
+        ),
+        200,
+    )
+
+
 def _build_sdk_contract(game_id: str, session_id: str) -> Dict[str, Any]:
     return {
         "name": "InZone Game SDK",
@@ -511,6 +619,12 @@ class SocialLoopService:
             },
             "economy": _get_social_loop_economy(),
             "actions": [
+                {
+                    "name": "GameState",
+                    "method": "GET",
+                    "path": f"{GAME_SDK_BASE_PATH}/game-state",
+                    "description": "Fetch balance, transactions, and scores for a player.",
+                },
                 {
                     "name": "PostScore",
                     "method": "POST",
@@ -575,7 +689,18 @@ class SocialLoopService:
     def dashboard(data: Dict[str, Any]):
         game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
         user_id = _normalize_string(data.get("userId") or data.get("UserId"))
+        game_key = _normalize_string(data.get("gameKey") or data.get("GameKey") or data.get("game_key"))
+        key_error = _require_game_key(game_id, game_key)
+        if key_error is not None:
+            return key_error
         return _build_dashboard_summary(game_id=game_id, user_id=user_id)
+
+    @staticmethod
+    def game_state(data: Dict[str, Any]):
+        game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
+        user_id = _normalize_string(data.get("userId") or data.get("UserId") or data.get("playerId") or data.get("PlayerId"))
+        game_key = _normalize_string(data.get("gameKey") or data.get("GameKey") or data.get("game_key"))
+        return _build_game_state(game_id=game_id, user_id=user_id, game_key=game_key)
 
     @staticmethod
     def purchase_coin_tier(data: Dict[str, Any], coins: int):
@@ -584,6 +709,11 @@ class SocialLoopService:
         user_id = _normalize_string(data.get("userId") or data.get("UserId") or data.get("playerId") or data.get("PlayerId"))
         game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
         transaction_id = _normalize_string(data.get("transactionId") or data.get("TransactionId")) or None
+        game_key = _normalize_string(data.get("gameKey") or data.get("GameKey") or data.get("game_key"))
+
+        key_error = _require_game_key(game_id, game_key)
+        if key_error is not None:
+            return key_error
 
         tier_data = COIN_TIERS.get(coins)
         if not tier_data:
@@ -610,6 +740,79 @@ class SocialLoopService:
             "commissionRate": COIN_COMMISSION_RATE,
         }
         return jsonify(payload), 200
+
+    @staticmethod
+    def register_games(data: Dict[str, Any]):
+        developer_id = _normalize_string(data.get("developerId") or data.get("developer_id"))
+        games = data.get("games") or []
+        if not developer_id:
+            return _error_response("MISSING_DEVELOPER_ID", "developerId is required", 400)
+        if not isinstance(games, list) or not games:
+            return _error_response("MISSING_GAMES", "games list is required", 400)
+
+        developer_ref = db.collection(GAME_DEVELOPERS_COLLECTION).document(developer_id)
+        developer_doc = developer_ref.get()
+        developer_data = developer_doc.to_dict() if developer_doc.exists else {}
+        stored_key = _normalize_string(developer_data.get("game_key") or developer_data.get("gameKey"))
+
+        incoming_key = _normalize_string(data.get("gameKey") or data.get("game_key"))
+        if stored_key and incoming_key and stored_key != incoming_key:
+            return _error_response("INVALID_GAME_KEY", "Invalid gameKey", 403)
+
+        game_key = stored_key or incoming_key or uuid.uuid4().hex
+
+        developer_ref.set(
+            {
+                "developer_id": developer_id,
+                "game_key": game_key,
+                "game_count": len(games),
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                "created_at": developer_data.get("created_at") or firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
+        batch = db.batch()
+        saved_games: List[str] = []
+
+        for game in games:
+            if not isinstance(game, dict):
+                continue
+            game_id = _normalize_string(game.get("gameId") or game.get("id"))
+            if not game_id:
+                continue
+
+            game_payload = {
+                "game_id": game_id,
+                "game_name": _normalize_string(game.get("gameName") or game.get("name")),
+                "description": _normalize_string(game.get("description")),
+                "icon_url": _normalize_string(game.get("iconUrl") or game.get("icon")),
+                "game_url": _normalize_string(game.get("gameUrl") or game.get("url")),
+                "genre": _normalize_string(game.get("genre")),
+                "developer_id": developer_id,
+                "game_key": game_key,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+                "created_at": game.get("created_at") or firestore.SERVER_TIMESTAMP,
+            }
+
+            doc_ref = db.collection(GAME_REGISTRY_COLLECTION).document(game_id)
+            batch.set(doc_ref, game_payload, merge=True)
+            saved_games.append(game_id)
+
+        if saved_games:
+            batch.commit()
+
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "developerId": developer_id,
+                    "gameKey": game_key,
+                    "gamesSaved": saved_games,
+                }
+            ),
+            200,
+        )
 
     @staticmethod
     def post_score(data: Dict[str, Any]):
