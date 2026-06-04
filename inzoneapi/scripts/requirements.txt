@@ -1,0 +1,13 @@
+# Requirements for clean_broken_videos.py script
+
+# Firebase Admin SDK - Required
+firebase-admin>=6.2.0
+
+# OpenCV for video codec validation - Highly Recommended
+opencv-python>=4.8.0
+
+# HTTP requests for URL validation - Required
+requests>=2.31.0
+
+# Optional: Progress bar for large collections
+tqdm>=4.66.0

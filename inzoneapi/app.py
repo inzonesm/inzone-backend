@@ -43,6 +43,8 @@ from routes.api.sentiment import sentiment_bp
 from routes.api.chat import api_chat_bp
 from routes.api.users import api_users_bp
 from routes.api.profiles import api_profiles_bp
+from routes.api.minigames import minigames_api_bp
+from routes.api.social_loop import game_sdk_bp
 from routes.scheduler.notifications import scheduler_notif_bp
 
 # Set up logging
@@ -94,6 +96,8 @@ app.register_blueprint(sentiment_bp)
 app.register_blueprint(api_chat_bp)
 app.register_blueprint(api_users_bp)
 app.register_blueprint(api_profiles_bp)
+app.register_blueprint(minigames_api_bp)
+app.register_blueprint(game_sdk_bp)
 app.register_blueprint(scheduler_notif_bp)
 
 # Favicon route to prevent 404 errors

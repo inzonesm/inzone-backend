@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -14,6 +17,9 @@ from services.minigames.gameover_service import MinigameGameoverService
 logger = logging.getLogger(__name__)
 
 COIN_COMMISSION_RATE = 0.10
+GAME_SDK_BASE_PATH = "/api/game-sdk"
+GAME_REGISTRY_COLLECTION = "html_games"
+GAME_DEVELOPERS_COLLECTION = "game_developers"
 
 COIN_TIERS: Dict[int, Dict[str, Any]] = {
     10: {
@@ -37,117 +43,103 @@ COIN_TIERS: Dict[int, Dict[str, Any]] = {
     400: {
         "tier": "tier-400",
         "title": "Tier 4",
-        "name": "Commitment",
-        "summary": "The highest value exchange.",
+        "name": "Momentum",
+        "summary": "A premium unlock with the largest impact.",
     },
 }
 
-GAME_SDK_BASE_PATH = "/api/game-sdk"
-GAME_REGISTRY_COLLECTION = "game_registry"
-GAME_DEVELOPERS_COLLECTION = "game_developers"
+METRICS_COLLECTION = "game_sdk_metrics"
+# Maximum latency samples stored per hourly bucket (for percentile calculations)
+MAX_LATENCY_SAMPLES_PER_BUCKET = 200
 
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _record_request_metric(
+    *,
+    game_id: str,
+    endpoint: str,
+    latency_ms: float,
+    status_code: int,
+    is_error: bool = False,
+) -> None:
+    """Record a single API request metric into an hourly bucket document.
+
+    Collection: game_sdk_metrics
+    Document ID: {game_id}_{YYYY-MM-DDTHH}  (one doc per game per hour)
+
+    Each doc aggregates: request count, error count, total latency (for avg),
+    and a capped array of latency samples (for percentile calculations).
+    """
+    if not game_id:
+        return
+    try:
+        now = _utc_now()
+        hour_key = now.strftime("%Y-%m-%dT%H")
+        doc_id = f"{game_id}_{hour_key}"
+        ref = db.collection(METRICS_COLLECTION).document(doc_id)
+
+        ref.set(
+            {
+                "game_id": game_id,
+                "hour": hour_key,
+                "requests": firestore.Increment(1),
+                "errors": firestore.Increment(1 if is_error else 0),
+                "total_latency_ms": firestore.Increment(latency_ms),
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
+        # Append latency sample (capped at MAX_LATENCY_SAMPLES_PER_BUCKET).
+        # ArrayUnion won't duplicate the exact same float, so we add a tiny
+        # random jitter to keep every sample unique.
+        jittered = round(latency_ms, 3)
+        ref.update(
+            {
+                "latency_samples": firestore.ArrayUnion([jittered]),
+                "endpoints_hit": firestore.ArrayUnion([endpoint]),
+            }
+        )
+    except Exception:
+        # Metrics recording is best-effort — never fail the request.
+        logger.debug("Failed to record request metric for %s", game_id, exc_info=True)
 
 
 def _normalize_string(value: Any) -> str:
     if value is None:
         return ""
+    if isinstance(value, str):
+        return value.strip()
     return str(value).strip()
 
 
-def _parse_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y"}
-    return default
-
-
 def _parse_number(value: Any) -> Optional[float]:
-    if value is None or isinstance(value, bool):
+    if value is None or value == "":
         return None
     if isinstance(value, (int, float)):
-        return value
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            return int(text)
-        except ValueError:
-            try:
-                return float(text)
-            except ValueError:
-                return None
-    return None
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
-def _format_number(value: Any):
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return value
+def _format_number(value: Any) -> float | int:
+    parsed_value = _parse_number(value)
+    if parsed_value is None:
+        return 0
+    if float(parsed_value).is_integer():
+        return int(parsed_value)
+    return parsed_value
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _get_social_loop_economy() -> Dict[str, Any]:
-    return {
-        "commissionRate": COIN_COMMISSION_RATE,
-        "coinTiers": [
-            {
-                "coins": coins,
-                "route": f"{GAME_SDK_BASE_PATH}/coins/{tier_data['tier']}",
-                **tier_data,
-            }
-            for coins, tier_data in COIN_TIERS.items()
-        ],
-        "currency": {
-            "unit": "Coin",
-        },
-    }
-
-
-def _error_response(
-    code: str,
-    message: str,
-    status: int = 400,
-    details: Optional[Dict[str, Any]] = None,
-):
-    payload = {"success": False, "error": message, "code": code}
-    if details is not None:
-        payload["details"] = details
-    return jsonify(payload), status
-
-
-def _require_game_key(game_id: str, game_key: str):
-    if not game_id:
-        return _error_response("MISSING_GAME_ID", "gameId is required", 400)
-    if not game_key:
-        return _error_response("MISSING_GAME_KEY", "gameKey is required", 401)
-
-    game_doc = db.collection(GAME_REGISTRY_COLLECTION).document(game_id).get()
-    if not game_doc.exists:
-        return _error_response("GAME_NOT_REGISTERED", "Game not registered", 404)
-
-    game_data = game_doc.to_dict() or {}
-    stored_key = _normalize_string(game_data.get("game_key") or game_data.get("gameKey"))
-    developer_id = _normalize_string(game_data.get("developer_id") or game_data.get("developerId"))
-
-    if not stored_key and developer_id:
-        developer_doc = db.collection(GAME_DEVELOPERS_COLLECTION).document(developer_id).get()
-        if developer_doc.exists:
-            developer_data = developer_doc.to_dict() or {}
-            stored_key = _normalize_string(
-                developer_data.get("game_key") or developer_data.get("gameKey")
-            )
-
-    if not stored_key or stored_key != game_key:
-        return _error_response("INVALID_GAME_KEY", "Invalid gameKey", 403)
+def _first_present(data: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in data and data[key] not in (None, ""):
+            return data[key]
     return None
 
 
@@ -155,39 +147,62 @@ def _to_utc_datetime(value: Any) -> Optional[datetime]:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
     if isinstance(value, str):
+        cleaned_value = value.strip().replace("Z", "+00:00")
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            parsed_value = datetime.fromisoformat(cleaned_value)
         except ValueError:
             return None
+        return parsed_value.astimezone(timezone.utc) if parsed_value.tzinfo else parsed_value.replace(tzinfo=timezone.utc)
     return None
 
 
-def _day_key(value: Optional[datetime] = None) -> str:
-    moment = value or datetime.now(timezone.utc)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc).date().isoformat()
+def _error_response(code: str, message: str, status: int, details: Optional[Dict[str, Any]] = None):
+    payload: Dict[str, Any] = {
+        "success": False,
+        "error": {
+            "code": code,
+            "message": message,
+            "status": status,
+        },
+    }
+    if details is not None:
+        payload["error"]["details"] = details
+    return jsonify(payload), status
+
+
+def _require_game_key(game_id: str, game_key: str):
+    if not game_key:
+        return _error_response("MISSING_GAME_KEY", "gameKey is required", 400)
+
+    game_doc = db.collection("html_games").document(game_id).get()
+    if not game_doc.exists:
+        return _error_response("GAME_NOT_FOUND", "Game not found", 404)
+
+    game_data = game_doc.to_dict() or {}
+    stored_key = _normalize_string(game_data.get("game_key") or game_data.get("gameKey"))
+    if stored_key and stored_key != game_key:
+        return _error_response("INVALID_GAME_KEY", "Invalid gameKey", 403)
+
+    return None
 
 
 def _record_game_activity(
     *,
     user_id: str,
     game_id: str,
-    session_id: str = "",
-    activity_type: str = "game_event",
+    session_id: Optional[str],
+    activity_type: str,
     is_transaction: bool = False,
 ) -> None:
-    if not user_id or not game_id:
-        return
-
-    activity_ref = db.collection("game_player_activity").document(f"{game_id}:{user_id}")
+    now = _utc_now()
+    day_key = now.date().isoformat()
+    activity_ref = db.collection("game_activity").document(f"{game_id}_{user_id}")
     activity_doc = activity_ref.get()
     activity_data = activity_doc.to_dict() if activity_doc.exists else {}
-    now = datetime.now(timezone.utc)
-    day_key = _day_key(now)
     active_days = set(activity_data.get("active_days", []))
     active_days.add(day_key)
 
@@ -200,8 +215,7 @@ def _record_game_activity(
         "first_seen_at": activity_data.get("first_seen_at") or now,
         "active_days": sorted(active_days),
         "activity_count": int(activity_data.get("activity_count", 0)) + 1,
-        "transaction_count": int(activity_data.get("transaction_count", 0))
-        + (1 if is_transaction else 0),
+        "transaction_count": int(activity_data.get("transaction_count", 0)) + (1 if is_transaction else 0),
         "updated_at": firestore.SERVER_TIMESTAMP,
     }
 
@@ -209,6 +223,22 @@ def _record_game_activity(
         update_data["last_transaction_at"] = now
 
     activity_ref.set(update_data, merge=True)
+
+
+def _get_social_loop_economy() -> List[Dict[str, Any]]:
+    economy: List[Dict[str, Any]] = []
+    for coins, tier_data in sorted(COIN_TIERS.items()):
+        commission_coins = int(round(coins * COIN_COMMISSION_RATE))
+        economy.append(
+            {
+                "coins": coins,
+                **tier_data,
+                "commissionRate": COIN_COMMISSION_RATE,
+                "commissionCoins": commission_coins,
+                "developerCoins": coins - commission_coins,
+            }
+        )
+    return economy
 
 
 def _increment_summary(current: Dict[str, Any], key: str, amount: int) -> int:
@@ -222,6 +252,7 @@ def _build_coin_response(
     title: str,
     description: str,
     coins: int,
+    session_id: Optional[str] = None,
     transaction_id: Optional[str] = None,
 ) -> tuple:
     if not user_id:
@@ -302,7 +333,7 @@ def _build_coin_response(
     _record_game_activity(
         user_id=user_id,
         game_id=game_id,
-        session_id=_normalize_string(summary_data.get("last_session_id")),
+        session_id=session_id or _normalize_string(summary_data.get("last_session_id")),
         activity_type="coin_transaction",
         is_transaction=True,
     )
@@ -725,6 +756,7 @@ class SocialLoopService:
             title=title,
             description=description,
             coins=coins,
+            session_id=_normalize_string(data.get("sessionId") or data.get("SessionId")),
             transaction_id=transaction_id,
         )
         response_obj, status_code = response if isinstance(response, tuple) else (response, 200)
@@ -740,6 +772,49 @@ class SocialLoopService:
             "commissionRate": COIN_COMMISSION_RATE,
         }
         return jsonify(payload), 200
+
+    @staticmethod
+    def list_games(data: Dict[str, Any]):
+        """Return every game registered under a developer (or a single game
+        when gameId is supplied). Used by the Studio portal sidebar."""
+        developer_id = _normalize_string(data.get("developerId") or data.get("developer_id"))
+        game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
+        game_key = _normalize_string(data.get("gameKey") or data.get("game_key"))
+
+        if not developer_id and not game_id:
+            return _error_response(
+                "MISSING_DEVELOPER_ID",
+                "developerId or gameId is required",
+                400,
+            )
+
+        if game_id:
+            key_error = _require_game_key(game_id, game_key)
+            if key_error is not None:
+                return key_error
+            doc = db.collection(GAME_REGISTRY_COLLECTION).document(game_id).get()
+            games = [doc.to_dict()] if doc.exists else []
+        else:
+            query = db.collection(GAME_REGISTRY_COLLECTION).where(
+                "developer_id", "==", developer_id
+            )
+            games = [snap.to_dict() for snap in query.stream()]
+
+        formatted = [
+            {
+                "gameId": g.get("game_id"),
+                "name": g.get("game_name"),
+                "description": g.get("description"),
+                "iconUrl": g.get("icon_url"),
+                "developerId": g.get("developer_id"),
+                "developerName": g.get("developer_name"),
+                "liveUrl": g.get("live_url"),
+                "status": g.get("status") or "live",
+            }
+            for g in games
+            if isinstance(g, dict)
+        ]
+        return jsonify({"success": True, "games": formatted}), 200
 
     @staticmethod
     def register_games(data: Dict[str, Any]):
@@ -816,28 +891,53 @@ class SocialLoopService:
 
     @staticmethod
     def post_score(data: Dict[str, Any]):
+        game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
+        player_id = _normalize_string(data.get("playerId") or data.get("PlayerId"))
+        session_id = _normalize_string(data.get("sessionId") or data.get("SessionId"))
+        score_value = _format_number(_parse_number(_first_present(data, "score", "Score")))
+        player_name = _normalize_string(data.get("playerName") or data.get("PlayerName")) or player_id
+        metadata = data.get("metadata") or data.get("Metadata") or {}
+
+        # Delegate to gameover service for legacy processing
         response = MinigameGameoverService.build_payload(data)
         response_obj, status_code = response if isinstance(response, tuple) else (response, 200)
         if status_code != 200:
             return response
 
         payload = response_obj.get_json(silent=True) or {}
+
+        # ── Write to html_games/{gameId}/leaderboard subcollection ──
+        if game_id and score_value is not None:
+            entry_id = f"{player_id}_{uuid.uuid4().hex[:8]}" if player_id else uuid.uuid4().hex
+            leaderboard_entry = {
+                "entry_id": entry_id,
+                "game_id": game_id,
+                "player_id": player_id or None,
+                "player_name": player_name,
+                "score": score_value,
+                "session_id": session_id or None,
+                "metadata": metadata if isinstance(metadata, dict) else {},
+                "created_at": firestore.SERVER_TIMESTAMP,
+            }
+            db.collection("html_games").document(game_id).collection("leaderboard").document(entry_id).set(leaderboard_entry)
+
         payload["economy"] = _get_social_loop_economy()
-        payload["sdk"] = _build_sdk_contract(
-            _normalize_string(data.get("gameId") or data.get("GameId")),
-            _normalize_string(data.get("sessionId") or data.get("SessionId")),
-        )
+        payload["sdk"] = _build_sdk_contract(game_id, session_id)
         payload["endpoint"] = "post-score"
         _record_game_activity(
-            user_id=_normalize_string(data.get("playerId") or data.get("PlayerId")),
-            game_id=_normalize_string(data.get("gameId") or data.get("GameId")),
-            session_id=_normalize_string(data.get("sessionId") or data.get("SessionId")),
+            user_id=player_id,
+            game_id=game_id,
+            session_id=session_id,
             activity_type="post_score",
         )
         return jsonify(payload), 200
 
     @staticmethod
     def send_challenge(data: Dict[str, Any]):
+        """Send a challenge to a friend — merges the old share-card + send-challenge
+        into one endpoint that works like Flutter's 'Challenge a Friend' button.
+        Sends game link + score, generates a share card, and writes to both
+        game_challenges and game_share_cards collections."""
         game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
         sender_id = _normalize_string(
             data.get("senderId") or data.get("SenderId") or data.get("playerId") or data.get("PlayerId")
@@ -845,28 +945,37 @@ class SocialLoopService:
         recipient_id = _normalize_string(
             data.get("recipientId") or data.get("RecipientId") or data.get("friendId") or data.get("FriendId")
         )
-        challenge_score = _format_number(_parse_number(data.get("score") or data.get("Score")))
+        challenge_score = _format_number(_parse_number(_first_present(data, "score", "Score")))
         session_id = _normalize_string(data.get("sessionId") or data.get("SessionId"))
         expires_hours = _parse_number(data.get("expiresHours") or data.get("ExpiresHours")) or 24
         challenge_message = _normalize_string(data.get("message") or data.get("Message")) or "Can you beat this score?"
         challenge_type = _normalize_string(data.get("challengeType") or data.get("ChallengeType")) or "duel"
         share_url = _normalize_string(data.get("shareUrl") or data.get("ShareUrl")) or f"https://inzone.app/game/{game_id}"
 
+        # Share card fields (merged from old share-card endpoint)
+        title = _normalize_string(data.get("title") or data.get("Title")) or (
+            f"I just scored {challenge_score} — beat me 🎯" if challenge_score else f"Beat my score in {game_id}!"
+        )
+        template = _normalize_string(data.get("template") or data.get("Template")) or "default"
+        image_url = _normalize_string(data.get("imageUrl") or data.get("ImageUrl")) or None
+
+        share_text_parts = [title, challenge_message, share_url]
+        share_text = "\n".join([part for part in share_text_parts if part])
+
         if not game_id:
             return _error_response("MISSING_GAME_ID", "gameId is required", 400)
         if not sender_id:
             return _error_response("MISSING_SENDER_ID", "senderId is required", 400)
-        if not recipient_id:
-            return _error_response("MISSING_RECIPIENT_ID", "recipientId is required", 400)
 
         challenge_id = _normalize_string(data.get("challengeId") or data.get("ChallengeId")) or uuid.uuid4().hex
         expires_at = datetime.now(timezone.utc) + timedelta(hours=float(expires_hours))
 
+        # ── Write challenge doc ──
         challenge_data = {
             "challenge_id": challenge_id,
             "game_id": game_id,
             "sender_id": sender_id,
-            "recipient_id": recipient_id,
+            "recipient_id": recipient_id or None,
             "challenge_type": challenge_type,
             "score": challenge_score,
             "message": challenge_message,
@@ -876,8 +985,26 @@ class SocialLoopService:
             "expires_at": expires_at,
             "created_at": firestore.SERVER_TIMESTAMP,
         }
-
         db.collection("game_challenges").document(challenge_id).set(challenge_data)
+
+        # ── Write share card doc (merged from old share-card endpoint) ──
+        share_card_id = uuid.uuid4().hex
+        share_card_data = {
+            "share_card_id": share_card_id,
+            "game_id": game_id,
+            "user_id": sender_id,
+            "score": challenge_score,
+            "title": title,
+            "message": challenge_message,
+            "share_url": share_url,
+            "template": template,
+            "image_url": image_url,
+            "session_id": session_id or None,
+            "challenge_id": challenge_id,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
+        db.collection("game_share_cards").document(share_card_id).set(share_card_data)
+
         _record_game_activity(
             user_id=sender_id,
             game_id=game_id,
@@ -892,75 +1019,27 @@ class SocialLoopService:
                 "challengeId": challenge_id,
                 "gameId": game_id,
                 "senderId": sender_id,
-                "recipientId": recipient_id,
+                "recipientId": recipient_id or None,
                 "type": challenge_type,
                 "score": challenge_score,
                 "message": challenge_message,
                 "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
                 "status": "pending",
             },
-            "share": {
-                "title": f"Beat my score in {game_id}!",
-                "message": challenge_message,
-                "url": share_url,
-            },
-            "economy": _get_social_loop_economy(),
-            "sdk": _build_sdk_contract(game_id, session_id),
-        }
-        return jsonify(payload), 200
-
-    @staticmethod
-    def share_card(data: Dict[str, Any]):
-        game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
-        user_id = _normalize_string(data.get("userId") or data.get("UserId") or data.get("playerId") or data.get("PlayerId"))
-        score_value = _format_number(_parse_number(data.get("score") or data.get("Score")))
-        session_id = _normalize_string(data.get("sessionId") or data.get("SessionId"))
-        title = _normalize_string(data.get("title") or data.get("Title")) or (f"I scored {score_value} in {game_id}!" if game_id and score_value is not None else "InZone result card")
-        message = _normalize_string(data.get("message") or data.get("Message")) or "Can you beat me?"
-        share_url = _normalize_string(data.get("shareUrl") or data.get("ShareUrl")) or f"https://inzone.app/game/{game_id}"
-        template = _normalize_string(data.get("template") or data.get("Template")) or "default"
-        image_url = _normalize_string(data.get("imageUrl") or data.get("ImageUrl")) or None
-
-        if not game_id:
-            return _error_response("MISSING_GAME_ID", "gameId is required", 400)
-        if score_value is None:
-            return _error_response("MISSING_SCORE", "score is required", 400)
-
-        share_card_id = _normalize_string(data.get("shareCardId") or data.get("ShareCardId")) or uuid.uuid4().hex
-        share_card_data = {
-            "share_card_id": share_card_id,
-            "game_id": game_id,
-            "user_id": user_id or None,
-            "score": score_value,
-            "title": title,
-            "message": message,
-            "share_url": share_url,
-            "template": template,
-            "image_url": image_url,
-            "session_id": session_id or None,
-            "created_at": firestore.SERVER_TIMESTAMP,
-        }
-        db.collection("game_share_cards").document(share_card_id).set(share_card_data)
-        _record_game_activity(
-            user_id=user_id,
-            game_id=game_id,
-            session_id=session_id,
-            activity_type="share_card",
-        )
-
-        payload = {
-            "success": True,
-            "endpoint": "share-card",
             "shareCard": {
                 "shareCardId": share_card_id,
-                "gameId": game_id,
-                "userId": user_id or None,
-                "score": score_value,
                 "title": title,
-                "message": message,
+                "message": challenge_message,
                 "url": share_url,
                 "template": template,
                 "imageUrl": image_url,
+            },
+            "share": {
+                "title": title,
+                "message": challenge_message,
+                "url": share_url,
+                "text": share_text,
+                "subject": title,
             },
             "shareTargets": ["iMessage", "WhatsApp", "Discord", "TikTok", "Instagram", "X"],
             "economy": _get_social_loop_economy(),
@@ -969,11 +1048,155 @@ class SocialLoopService:
         return jsonify(payload), 200
 
     @staticmethod
+    def progress_share(data: Dict[str, Any]):
+        """Share game progress — generates a shareable visual/snapshot of an
+        achievement or run, like Flutter's 'Share Progress' button.
+        Writes to game_share_cards with type='progress'."""
+        game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
+        user_id = _normalize_string(
+            data.get("userId") or data.get("UserId") or data.get("playerId") or data.get("PlayerId")
+        )
+        session_id = _normalize_string(data.get("sessionId") or data.get("SessionId"))
+        score_value = _format_number(_parse_number(_first_present(data, "score", "Score")))
+        title = _normalize_string(data.get("title") or data.get("Title")) or (
+            f"New high score — {score_value}!" if score_value else "Check out my progress!"
+        )
+        message = _normalize_string(data.get("message") or data.get("Message")) or "Check out what I just did 🔥"
+        share_url = _normalize_string(data.get("shareUrl") or data.get("ShareUrl")) or f"https://inzone.app/game/{game_id}"
+        visual = _normalize_string(data.get("visual") or data.get("Visual")) or "auto"
+        metrics = data.get("metrics") or data.get("Metrics") or {}
+        if not isinstance(metrics, dict):
+            metrics = {"value": metrics}
+        achievements = data.get("achievements") or data.get("Achievements") or []
+        if not isinstance(achievements, list):
+            achievements = [achievements]
+        template = _normalize_string(data.get("template") or data.get("Template")) or "progress"
+        image_url = _normalize_string(data.get("imageUrl") or data.get("ImageUrl")) or None
+
+        if not game_id:
+            return _error_response("MISSING_GAME_ID", "gameId is required", 400)
+        if not user_id:
+            return _error_response("MISSING_USER_ID", "userId is required", 400)
+
+        share_card_id = uuid.uuid4().hex
+        share_card_data = {
+            "share_card_id": share_card_id,
+            "type": "progress",
+            "game_id": game_id,
+            "user_id": user_id,
+            "score": score_value,
+            "title": title,
+            "message": message,
+            "share_url": share_url,
+            "visual": visual,
+            "metrics": metrics,
+            "achievements": achievements,
+            "template": template,
+            "image_url": image_url,
+            "session_id": session_id or None,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
+        db.collection("game_share_cards").document(share_card_id).set(share_card_data)
+
+        _record_game_activity(
+            user_id=user_id,
+            game_id=game_id,
+            session_id=session_id,
+            activity_type="progress_share",
+        )
+
+        payload = {
+            "success": True,
+            "endpoint": "progress/share",
+            "shareCard": {
+                "shareCardId": share_card_id,
+                "gameId": game_id,
+                "userId": user_id,
+                "score": score_value,
+                "title": title,
+                "message": message,
+                "url": share_url,
+                "visual": visual,
+                "metrics": metrics,
+                "achievements": achievements,
+                "template": template,
+                "imageUrl": image_url,
+            },
+            "share": {
+                "title": title,
+                "message": message,
+                "url": share_url,
+            },
+            "shareTargets": ["iMessage", "WhatsApp", "Discord", "TikTok", "Instagram", "X"],
+            "economy": _get_social_loop_economy(),
+            "sdk": _build_sdk_contract(game_id, session_id),
+        }
+        return jsonify(payload), 200
+
+    @staticmethod
+    def get_leaderboard(data: Dict[str, Any]):
+        """Retrieve the leaderboard for a game from html_games/{gameId}/leaderboard."""
+        game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
+        limit = int(_parse_number(data.get("limit") or data.get("Limit")) or 50)
+        scope = _normalize_string(data.get("scope") or data.get("Scope")) or "global"
+
+        if not game_id:
+            return _error_response("MISSING_GAME_ID", "gameId is required", 400)
+        if limit < 1:
+            limit = 50
+        if limit > 200:
+            limit = 200
+
+        leaderboard_ref = (
+            db.collection("html_games")
+            .document(game_id)
+            .collection("leaderboard")
+            .order_by("score", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+        )
+        docs = leaderboard_ref.stream()
+
+        entries = []
+        rank = 0
+        for doc in docs:
+            rank += 1
+            entry = doc.to_dict() or {}
+            created_at = entry.get("created_at")
+            if hasattr(created_at, "isoformat"):
+                created_at = created_at.isoformat().replace("+00:00", "Z")
+            else:
+                created_at = str(created_at) if created_at else None
+
+            entries.append({
+                "rank": rank,
+                "entryId": entry.get("entry_id", doc.id),
+                "playerId": entry.get("player_id"),
+                "playerName": entry.get("player_name"),
+                "score": entry.get("score", 0),
+                "metadata": entry.get("metadata", {}),
+                "createdAt": created_at,
+            })
+
+        payload = {
+            "success": True,
+            "endpoint": "leaderboard",
+            "gameId": game_id,
+            "scope": scope,
+            "totalEntries": len(entries),
+            "entries": entries,
+        }
+        return jsonify(payload), 200
+
+    @staticmethod
     def open_chat(data: Dict[str, Any]):
+        """Open or join the game's designated group chat. Sends a message to
+        the conversation thread tied to the game. If the conversation doesn't
+        exist yet it's created; if it does, participants are merged in."""
         game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
         session_id = _normalize_string(data.get("sessionId") or data.get("SessionId"))
         thread_id = _normalize_string(data.get("threadId") or data.get("ThreadId"))
         user_id = _normalize_string(data.get("userId") or data.get("UserId") or data.get("playerId") or data.get("PlayerId"))
+        message = _normalize_string(data.get("message") or data.get("Message")) or "A new player joined the game thread"
         characters = data.get("characters") or data.get("Characters") or []
         if not isinstance(characters, list):
             characters = [characters]
@@ -1004,7 +1227,7 @@ class SocialLoopService:
             "participants": participants,
             "characters": characters,
             "context": context,
-            "lastMessage": "A new player joined the game thread",
+            "lastMessage": message,
             "lastMessageTime": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
             "createdAt": firestore.SERVER_TIMESTAMP,
@@ -1045,5 +1268,120 @@ class SocialLoopService:
             },
             "economy": _get_social_loop_economy(),
             "sdk": _build_sdk_contract(game_id, session_id),
+        }
+        return jsonify(payload), 200
+
+    # ────────────────────────────────────────────────────────────────
+    # Integration Health
+    # ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def integration_health(data: Dict[str, Any]):
+        """Return integration health stats for a game over the last 24 hours.
+
+        Aggregates from game_sdk_metrics hourly bucket docs:
+          - Total request count
+          - Error count / error rate %
+          - Average latency (ms)
+          - p95 latency (ms)
+          - Endpoints hit
+          - Hourly breakdown for sparklines
+        """
+        game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
+        hours_back = int(_parse_number(data.get("hours") or data.get("Hours")) or 24)
+        if hours_back < 1:
+            hours_back = 24
+        if hours_back > 168:  # cap at 7 days
+            hours_back = 168
+
+        if not game_id:
+            return _error_response("MISSING_GAME_ID", "gameId is required", 400)
+
+        now = _utc_now()
+        hour_keys = []
+        for i in range(hours_back):
+            h = now - timedelta(hours=i)
+            hour_keys.append(f"{game_id}_{h.strftime('%Y-%m-%dT%H')}")
+
+        total_requests = 0
+        total_errors = 0
+        total_latency_ms = 0.0
+        all_latency_samples: List[float] = []
+        endpoints_hit: set = set()
+        hourly_breakdown: List[Dict[str, Any]] = []
+
+        # Fetch all hourly bucket docs (batch get)
+        refs = [db.collection(METRICS_COLLECTION).document(doc_id) for doc_id in hour_keys]
+        docs = db.get_all(refs)
+
+        for doc in docs:
+            if not doc.exists:
+                continue
+            bucket = doc.to_dict() or {}
+            reqs = int(bucket.get("requests", 0))
+            errs = int(bucket.get("errors", 0))
+            lat_sum = float(bucket.get("total_latency_ms", 0))
+            samples = bucket.get("latency_samples", [])
+            eps = bucket.get("endpoints_hit", [])
+
+            total_requests += reqs
+            total_errors += errs
+            total_latency_ms += lat_sum
+            if isinstance(samples, list):
+                all_latency_samples.extend(samples)
+            if isinstance(eps, list):
+                endpoints_hit.update(eps)
+
+            hourly_breakdown.append({
+                "hour": bucket.get("hour", doc.id),
+                "requests": reqs,
+                "errors": errs,
+                "avgLatencyMs": round(lat_sum / reqs, 1) if reqs > 0 else 0,
+            })
+
+        # Sort hourly breakdown chronologically
+        hourly_breakdown.sort(key=lambda x: x["hour"])
+
+        # Calculate percentiles
+        avg_latency_ms = round(total_latency_ms / total_requests, 1) if total_requests > 0 else 0
+        error_rate = round((total_errors / total_requests) * 100, 3) if total_requests > 0 else 0
+
+        p50_latency = 0.0
+        p95_latency = 0.0
+        p99_latency = 0.0
+        if all_latency_samples:
+            sorted_samples = sorted(all_latency_samples)
+            n = len(sorted_samples)
+            p50_latency = round(sorted_samples[int(n * 0.50)], 1)
+            p95_latency = round(sorted_samples[min(int(n * 0.95), n - 1)], 1)
+            p99_latency = round(sorted_samples[min(int(n * 0.99), n - 1)], 1)
+
+        # Format for display
+        def _fmt_count(count: int) -> str:
+            if count >= 1_000_000:
+                return f"{count / 1_000_000:.2f}M"
+            if count >= 1_000:
+                return f"{count / 1_000:.1f}K"
+            return str(count)
+
+        payload = {
+            "success": True,
+            "endpoint": "integration-health",
+            "gameId": game_id,
+            "period": f"last {hours_back}h",
+            "summary": {
+                "requests": total_requests,
+                "requestsFormatted": _fmt_count(total_requests),
+                "errors": total_errors,
+                "errorRate": error_rate,
+                "errorRateFormatted": f"{error_rate}%",
+                "avgLatencyMs": avg_latency_ms,
+                "p50LatencyMs": p50_latency,
+                "p95LatencyMs": p95_latency,
+                "p99LatencyMs": p99_latency,
+                "p95LatencyFormatted": f"{p95_latency}ms" if p95_latency > 0 else "—",
+                "endpointsHit": sorted(endpoints_hit),
+            },
+            "hourly": hourly_breakdown,
         }
         return jsonify(payload), 200

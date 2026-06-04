@@ -20,7 +20,7 @@ All endpoints live under:
 
 ## Security
 
-Each game developer is issued a `gameKey`. Include it in the request header:
+Each game developer is issued a `gameKey`. Include it in the request payload or query string, and mirror it in `X-Game-Key` when the route supports it.
 
 `X-Game-Key: <your-game-key>`
 
@@ -29,6 +29,8 @@ Required for:
 - `GET /api/game-sdk/game-state`
 - `POST /api/game-sdk/coins/*`
 - `GET /api/game-sdk/dashboard`
+
+The current routes accept `gameKey` in JSON bodies or query parameters. The route wrapper also copies `X-Game-Key` into the request payload for `GET /dashboard`, `GET /game-state`, and the coin routes.
 
 ## Gameplay Endpoints
 
@@ -123,6 +125,8 @@ Example request:
 `POST` `/api/game-sdk/share-card`
 
 Generates a branded social share payload for iMessage, Discord, TikTok, Instagram, X, and similar share sheets.
+The client is responsible for opening a share sheet (for example, the Web Share API on web) or showing a fallback
+modal that lets users copy the text and link.
 
 Example request:
 
