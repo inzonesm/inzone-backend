@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -20,6 +21,8 @@ COIN_COMMISSION_RATE = 0.10
 GAME_SDK_BASE_PATH = "/api/game-sdk"
 GAME_REGISTRY_COLLECTION = "html_games"
 GAME_DEVELOPERS_COLLECTION = "game_developers"
+GAME_PLAYER_STATE_COLLECTION = "game_player_state"
+MAX_STATE_BYTES = 256 * 1024  # 256 KB cap on a single player save blob
 
 COIN_TIERS: Dict[int, Dict[str, Any]] = {
     10: {
@@ -606,6 +609,135 @@ def _build_game_state(game_id: str, user_id: str, game_key: str) -> tuple:
     )
 
 
+def _save_player_state(
+    game_id: str,
+    user_id: str,
+    state: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> tuple:
+    """Persist a per-player save blob (progress, items, checkpoints).
+
+    The blob is opaque to InZone and is NOT authoritative for coins/balance —
+    those stay server-owned via the coin-tier purchase flow. Keyed by
+    {gameId}_{playerId} in the game_player_state collection. The player's uid is
+    supplied by the authenticated InZone host (not the game developer), so the
+    request is scoped to that user without a separate gameKey.
+    """
+    if not game_id:
+        return _error_response("MISSING_GAME_ID", "gameId is required", 400)
+    if not user_id:
+        return _error_response("MISSING_USER_ID", "userId is required", 400)
+
+    if not isinstance(state, dict):
+        return _error_response("INVALID_STATE", "state must be a JSON object", 400)
+
+    try:
+        encoded = json.dumps(state, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return _error_response("INVALID_STATE", "state must be JSON-serializable", 400)
+
+    byte_size = len(encoded.encode("utf-8"))
+    if byte_size > MAX_STATE_BYTES:
+        return _error_response(
+            "STATE_TOO_LARGE",
+            f"state exceeds {MAX_STATE_BYTES} bytes",
+            413,
+        )
+
+    now = _utc_now()
+    doc_ref = db.collection(GAME_PLAYER_STATE_COLLECTION).document(f"{game_id}_{user_id}")
+    existing = doc_ref.get()
+    created_at = now
+    if existing.exists:
+        created_at = (existing.to_dict() or {}).get("created_at") or now
+
+    update_data = {
+        "game_id": game_id,
+        "user_id": user_id,
+        "state": state,
+        "bytes": byte_size,
+        "version": firestore.Increment(1),
+        "metadata": metadata or {},
+        "created_at": created_at,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+    doc_ref.set(update_data, merge=True)
+
+    try:
+        _record_game_activity(
+            user_id=user_id,
+            game_id=game_id,
+            session_id=None,
+            activity_type="state_save",
+        )
+    except Exception:
+        logger.debug("Failed to record state_save activity", exc_info=True)
+
+    saved = doc_ref.get().to_dict() or {}
+    return (
+        jsonify(
+            {
+                "success": True,
+                "data": {
+                    "gameId": game_id,
+                    "playerId": user_id,
+                    "version": int(saved.get("version", 1)),
+                    "bytes": byte_size,
+                    "savedAt": now.isoformat(),
+                },
+            }
+        ),
+        200,
+    )
+
+
+def _load_player_state(game_id: str, user_id: str) -> tuple:
+    """Return the stored save blob for a player, or an empty state for a new
+    player (version 0) rather than a 404. Scoped to the host-supplied uid."""
+    if not game_id:
+        return _error_response("MISSING_GAME_ID", "gameId is required", 400)
+    if not user_id:
+        return _error_response("MISSING_USER_ID", "userId is required", 400)
+
+    doc = db.collection(GAME_PLAYER_STATE_COLLECTION).document(f"{game_id}_{user_id}").get()
+    if not doc.exists:
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "data": {
+                        "gameId": game_id,
+                        "playerId": user_id,
+                        "state": {},
+                        "version": 0,
+                        "metadata": {},
+                        "updatedAt": None,
+                    },
+                }
+            ),
+            200,
+        )
+
+    data = doc.to_dict() or {}
+    updated_at = data.get("updated_at")
+    return (
+        jsonify(
+            {
+                "success": True,
+                "data": {
+                    "gameId": game_id,
+                    "playerId": user_id,
+                    "state": data.get("state") or {},
+                    "version": int(data.get("version", 0)),
+                    "metadata": data.get("metadata") or {},
+                    "updatedAt": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
+                },
+            }
+        ),
+        200,
+    )
+
+
 def _build_sdk_contract(game_id: str, session_id: str) -> Dict[str, Any]:
     return {
         "name": "InZone Game SDK",
@@ -732,6 +864,29 @@ class SocialLoopService:
         user_id = _normalize_string(data.get("userId") or data.get("UserId") or data.get("playerId") or data.get("PlayerId"))
         game_key = _normalize_string(data.get("gameKey") or data.get("GameKey") or data.get("game_key"))
         return _build_game_state(game_id=game_id, user_id=user_id, game_key=game_key)
+
+    @staticmethod
+    def save_state(data: Dict[str, Any]):
+        game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
+        user_id = _normalize_string(
+            data.get("userId") or data.get("UserId") or data.get("playerId") or data.get("PlayerId")
+        )
+        state = data.get("state")
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else None
+        return _save_player_state(
+            game_id=game_id,
+            user_id=user_id,
+            state=state,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def load_state(data: Dict[str, Any]):
+        game_id = _normalize_string(data.get("gameId") or data.get("GameId"))
+        user_id = _normalize_string(
+            data.get("userId") or data.get("UserId") or data.get("playerId") or data.get("PlayerId")
+        )
+        return _load_player_state(game_id=game_id, user_id=user_id)
 
     @staticmethod
     def purchase_coin_tier(data: Dict[str, Any], coins: int):

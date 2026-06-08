@@ -217,6 +217,20 @@ def game_state():
         return _error_response("INTERNAL_ERROR", "Internal server error", 500)
 
 
+@game_sdk_bp.route("/api/game-sdk/state", methods=["GET", "POST"])
+def player_state():
+    try:
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            return SocialLoopService.save_state(data)
+        data = request.args.to_dict()
+        return SocialLoopService.load_state(data)
+    except ValueError as exc:
+        return _error_response("INVALID_REQUEST", str(exc), 400)
+    except Exception:
+        return _error_response("INTERNAL_ERROR", "Internal server error", 500)
+
+
 @game_sdk_bp.route("/api/game-sdk/games/register", methods=["POST"])
 def register_games():
     try:
