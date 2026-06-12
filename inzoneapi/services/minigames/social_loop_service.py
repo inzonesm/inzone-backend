@@ -177,9 +177,33 @@ def _error_response(code: str, message: str, status: int, details: Optional[Dict
     return jsonify(payload), status
 
 
+def _build_game_onelink(game_id: str) -> str:
+    """Build an AppsFlyer OneLink that opens a specific community (html) game.
+
+    Social-loop games live in the ``html_games`` collection and open on the
+    Game Hub via ``CommunityGameScreen`` — they are NOT Simula minigame-catalogue
+    games. The link therefore uses a dedicated ``community_game`` deep_link_value
+    and an ``inzone://game?gameId=…`` fallback scheme so the Flutter client routes
+    straight to the game hub instead of defaulting into the minigame catalogue.
+
+    On devices with the app installed the link opens the game directly;
+    on devices without it the link falls through to the app store listing."""
+    from urllib.parse import urlencode, quote
+
+    fallback = f"inzone://game?gameId={quote(game_id)}"
+    params = urlencode({
+        "af_xp": "custom",
+        "pid": "social_share",
+        "deep_link_value": "community_game",
+        "deep_link_sub1": game_id,
+        "af_dp": fallback,
+    })
+    return f"https://join-inzone.onelink.me/SACg?{params}"
+
+
 def _require_game_key(game_id: str, game_key: str):
-    if not game_key:
-        return _error_response("MISSING_GAME_KEY", "gameKey is required", 400)
+    if not game_id:
+        return _error_response("MISSING_GAME_ID", "gameId is required", 400)
 
     game_doc = db.collection("html_games").document(game_id).get()
     if not game_doc.exists:
@@ -187,8 +211,16 @@ def _require_game_key(game_id: str, game_key: str):
 
     game_data = game_doc.to_dict() or {}
     stored_key = _normalize_string(game_data.get("game_key") or game_data.get("gameKey"))
-    if stored_key and stored_key != game_key:
-        return _error_response("INVALID_GAME_KEY", "Invalid gameKey", 403)
+
+    # If the game was registered with a key, the caller must provide the
+    # matching key.  If the game has no stored key (e.g. added manually via
+    # the Firestore console), skip validation — requiring a key the developer
+    # was never given creates an impossible gate.
+    if stored_key:
+        if not game_key:
+            return _error_response("MISSING_GAME_KEY", "gameKey is required", 400)
+        if game_key != stored_key:
+            return _error_response("INVALID_GAME_KEY", "Invalid gameKey", 403)
 
     return None
 
@@ -1105,7 +1137,7 @@ class SocialLoopService:
         expires_hours = _parse_number(data.get("expiresHours") or data.get("ExpiresHours")) or 24
         challenge_message = _normalize_string(data.get("message") or data.get("Message")) or "Can you beat this score?"
         challenge_type = _normalize_string(data.get("challengeType") or data.get("ChallengeType")) or "duel"
-        share_url = _normalize_string(data.get("shareUrl") or data.get("ShareUrl")) or f"https://inzone.app/game/{game_id}"
+        share_url = _normalize_string(data.get("shareUrl") or data.get("ShareUrl")) or _build_game_onelink(game_id)
 
         # Share card fields (merged from old share-card endpoint)
         title = _normalize_string(data.get("title") or data.get("Title")) or (
@@ -1113,6 +1145,9 @@ class SocialLoopService:
         )
         template = _normalize_string(data.get("template") or data.get("Template")) or "default"
         image_url = _normalize_string(data.get("imageUrl") or data.get("ImageUrl")) or None
+
+        # Deep link that opens the game directly inside the InZone app
+        game_deep_link = _build_game_onelink(game_id) if game_id else share_url
 
         share_text_parts = [title, challenge_message, share_url]
         share_text = "\n".join([part for part in share_text_parts if part])
@@ -1135,6 +1170,7 @@ class SocialLoopService:
             "score": challenge_score,
             "message": challenge_message,
             "share_url": share_url,
+            "game_deep_link": game_deep_link,
             "session_id": session_id or None,
             "status": "pending",
             "expires_at": expires_at,
@@ -1180,6 +1216,7 @@ class SocialLoopService:
                 "message": challenge_message,
                 "expiresAt": expires_at.isoformat().replace("+00:00", "Z"),
                 "status": "pending",
+                "gameDeepLink": game_deep_link,
             },
             "shareCard": {
                 "shareCardId": share_card_id,
@@ -1193,6 +1230,7 @@ class SocialLoopService:
                 "title": title,
                 "message": challenge_message,
                 "url": share_url,
+                "gameDeepLink": game_deep_link,
                 "text": share_text,
                 "subject": title,
             },
@@ -1217,7 +1255,7 @@ class SocialLoopService:
             f"New high score — {score_value}!" if score_value else "Check out my progress!"
         )
         message = _normalize_string(data.get("message") or data.get("Message")) or "Check out what I just did 🔥"
-        share_url = _normalize_string(data.get("shareUrl") or data.get("ShareUrl")) or f"https://inzone.app/game/{game_id}"
+        share_url = _normalize_string(data.get("shareUrl") or data.get("ShareUrl")) or _build_game_onelink(game_id)
         visual = _normalize_string(data.get("visual") or data.get("Visual")) or "auto"
         metrics = data.get("metrics") or data.get("Metrics") or {}
         if not isinstance(metrics, dict):
@@ -1351,13 +1389,31 @@ class SocialLoopService:
         session_id = _normalize_string(data.get("sessionId") or data.get("SessionId"))
         thread_id = _normalize_string(data.get("threadId") or data.get("ThreadId"))
         user_id = _normalize_string(data.get("userId") or data.get("UserId") or data.get("playerId") or data.get("PlayerId"))
-        message = _normalize_string(data.get("message") or data.get("Message")) or "A new player joined the game thread"
+        explicit_message = _normalize_string(data.get("message") or data.get("Message"))
         characters = data.get("characters") or data.get("Characters") or []
         if not isinstance(characters, list):
             characters = [characters]
         context = data.get("context") or data.get("Context") or {}
         if not isinstance(context, dict):
             context = {"value": context}
+
+        # Build a meaningful message from context when none is provided
+        if explicit_message:
+            message = explicit_message
+        else:
+            score = _parse_number(context.get("score") or data.get("score") or data.get("Score"))
+            game_name = _normalize_string(context.get("gameName") or data.get("gameName") or data.get("GameName")) or game_id
+            result = _normalize_string(context.get("result"))
+            wave = _parse_number(context.get("wave"))
+
+            if score is not None and wave:
+                message = f"Scored {_format_number(score)} on wave {_format_number(wave)} in {game_name}"
+            elif score is not None:
+                message = f"Just scored {_format_number(score)} in {game_name}"
+            elif result:
+                message = f"Finished a round in {game_name} — {result}"
+            else:
+                message = "A new player joined the game thread"
 
         if not game_id and not thread_id:
             return _error_response("MISSING_GAME_OR_THREAD", "gameId or threadId is required", 400)
@@ -1399,6 +1455,28 @@ class SocialLoopService:
             conversation_data["createdAt"] = existing_data.get("createdAt", firestore.SERVER_TIMESTAMP)
 
         conversation_ref.set(conversation_data)
+
+        # ── Write the message to the messages subcollection ──
+        # The Flutter chat screens listen on conversations/{id}/messages,
+        # so writing only the conversation doc is not enough.
+        message_data = {
+            "text": message,
+            "senderId": user_id or None,
+            "senderName": user_id or "Player",
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "isRead": False,
+            "isGameChat": True,
+            "gameId": game_id or None,
+            "sessionId": session_id or None,
+        }
+        if context:
+            message_data["context"] = context
+
+        try:
+            conversation_ref.collection("messages").add(message_data)
+        except Exception as exc:
+            logger.warning("Failed to write chat message: %s", exc)
+
         _record_game_activity(
             user_id=user_id,
             game_id=game_id,
