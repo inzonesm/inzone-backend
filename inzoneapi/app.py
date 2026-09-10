@@ -211,5 +211,16 @@ app.register_blueprint(create_game_offers_blueprint(
     lambda: _offer_os.environ.get("INZONE_OFFER_CATALOG_ENABLED") == "1",
 ))
 
+# Separate activation from draft authoring. Shared-wallet rollout must be reviewed.
+from routes.api.offer_checkout import create_offer_checkout_blueprint
+from services.minigames.offer_checkout import OfferCheckout
+from services.minigames.social_loop_service import COIN_COMMISSION_RATE
+app.register_blueprint(create_offer_checkout_blueprint(
+    OfferCheckout(_offer_db, commission_rate=COIN_COMMISSION_RATE),
+    lambda token: _offer_auth.verify_id_token(token, check_revoked=True),
+    lambda: (_offer_os.environ.get("INZONE_OFFER_CHECKOUT_ENABLED") == "1"
+             and _offer_os.environ.get("INZONE_OFFER_CHECKOUT_WALLET_READY") == "1"),
+))
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8080)
