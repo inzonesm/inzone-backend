@@ -105,29 +105,15 @@ class AIVoiceChatService:
 
             # Step 4: Deduct coins
             try:
-                user_ref = db.collection("humanUsers").document(user_id)
-                user_snap = user_ref.get()
-
-                if not getattr(user_snap, "exists", False):
-                    return jsonify({
-                        "success": False,
-                        "error": "User not found",
-                        "stage": "coins"
-                    }), 404
-
-                balance = int((user_snap.to_dict() or {}).get("balance", 0))
-
-                if balance < VOICE_CHAT_COST:
-                    return jsonify({
-                        "success": False,
-                        "error": "Insufficient balance",
-                        "current_balance": balance,
-                        "required_coins": VOICE_CHAT_COST,
-                        "stage": "coins"
-                    }), 402
-
-                user_ref.update({"balance": balance - VOICE_CHAT_COST})
-                new_balance = balance - VOICE_CHAT_COST
+                from services.monetization.balance_updates import debit_balance, BalanceError
+                try:
+                    new_balance = debit_balance(db, user_id, VOICE_CHAT_COST)
+                except BalanceError as error:
+                    if error.code == 'USER_NOT_FOUND':
+                        return jsonify({"success": False, "error": "User not found", "stage": "coins"}), 404
+                    return jsonify({"success": False, "error": "Insufficient balance",
+                                    "current_balance": error.balance, "required_coins": VOICE_CHAT_COST,
+                                    "stage": "coins"}), 402
                 logger.info(f"[chat] coins ok new_balance={new_balance}")
             except Exception as e:
                 logger.exception("[chat] coins crash")

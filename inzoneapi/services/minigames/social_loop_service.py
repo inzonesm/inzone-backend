@@ -297,104 +297,24 @@ def _build_coin_response(
     if not title:
         return _error_response("MISSING_TITLE", "title is required", 400)
 
-    user_ref = db.collection("humanUsers").document(user_id)
-    user_doc = user_ref.get()
-    if not user_doc.exists:
-        return _error_response("USER_NOT_FOUND", "User not found", 404)
-
-    user_data = user_doc.to_dict() or {}
-    current_balance = int(user_data.get("balance", 200))
-    if current_balance < coins:
-        return _error_response(
-            "INSUFFICIENT_BALANCE",
-            "Insufficient balance",
-            400,
-            details={
-                "currentBalance": current_balance,
-                "required": coins,
-            },
+    from services.minigames.legacy_coin_purchase import purchase_legacy_coins, LegacyPurchaseError
+    try:
+        data, replayed, previous_session = purchase_legacy_coins(
+            db, user_id=user_id, game_id=game_id, title=title, description=description,
+            coins=coins, commission_rate=COIN_COMMISSION_RATE, transaction_id=transaction_id,
         )
-
-    commission_coins = int(round(coins * COIN_COMMISSION_RATE))
-    developer_coins = coins - commission_coins
-    new_balance = current_balance - coins
-    transaction_id = transaction_id or uuid.uuid4().hex
-    now = datetime.now(timezone.utc)
-
-    transaction_payload = {
-        "transaction_id": transaction_id,
-        "user_id": user_id,
-        "game_id": game_id,
-        "title": title,
-        "description": description or title,
-        "coins": coins,
-        "commission_coins": commission_coins,
-        "developer_coins": developer_coins,
-        "commission_rate": COIN_COMMISSION_RATE,
-        "status": "confirmed",
-        "currency": "Coin",
-        "created_at": firestore.SERVER_TIMESTAMP,
-        "created_at_local": now.isoformat(),
-    }
-
-    user_ref.update({"balance": new_balance})
-    db.collection("game_coin_transactions").document(transaction_id).set(transaction_payload)
-
-    summary_ref = db.collection("game_revenue_summary").document(game_id)
-    summary_doc = summary_ref.get()
-    summary_data = summary_doc.to_dict() if summary_doc.exists else {}
-    tier_breakdown = dict(summary_data.get("tier_breakdown", {}))
-    tier_breakdown[str(coins)] = _increment_summary(tier_breakdown, str(coins), 1)
-
-    summary_ref.set(
-        {
-            "game_id": game_id,
-            "transaction_count": _increment_summary(summary_data, "transaction_count", 1),
-            "gross_coins": _increment_summary(summary_data, "gross_coins", coins),
-            "commission_coins": _increment_summary(summary_data, "commission_coins", commission_coins),
-            "developer_payout_coins": _increment_summary(
-                summary_data, "developer_payout_coins", developer_coins
-            ),
-            "tier_breakdown": tier_breakdown,
-            "last_transaction_title": title,
-            "last_transaction_description": description or title,
-            "last_transaction_at": firestore.SERVER_TIMESTAMP,
-            "commission_rate": COIN_COMMISSION_RATE,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        },
-        merge=True,
-    )
-
-    _record_game_activity(
-        user_id=user_id,
-        game_id=game_id,
-        session_id=session_id or _normalize_string(summary_data.get("last_session_id")),
-        activity_type="coin_transaction",
-        is_transaction=True,
-    )
-
-    return (
-        jsonify(
-            {
-                "success": True,
-                "data": {
-                    "transactionId": transaction_id,
-                    "userId": user_id,
-                    "gameId": game_id,
-                    "title": title,
-                    "description": description or title,
-                    "coins": coins,
-                    "commissionCoins": commission_coins,
-                    "developerCoins": developer_coins,
-                    "commissionRate": COIN_COMMISSION_RATE,
-                    "newBalance": new_balance,
-                    "currency": "Coin",
-                    "confirmation": "Coin transaction confirmed",
-                },
-            }
-        ),
-        200,
-    )
+    except LegacyPurchaseError as exc:
+        return _error_response(exc.code, str(exc), exc.status, details=exc.details)
+    # A telemetry failure after commit must not turn a confirmed charge into an
+    # error that encourages the caller to retry with a different transaction ID.
+    if not replayed:
+        try:
+            _record_game_activity(user_id=user_id, game_id=game_id,
+                                  session_id=session_id or _normalize_string(previous_session),
+                                  activity_type="coin_transaction", is_transaction=True)
+        except Exception:
+            logger.warning("Post-purchase activity recording failed")
+    return jsonify({"success": True, "data": data}), 200
 
 
 def _build_dashboard_summary(game_id: str, user_id: str = "") -> tuple:
