@@ -62,30 +62,37 @@ class TippingService:
                 'createdAt': timestamp
             }
 
-            # Start transaction
-            transaction = db.transaction()
-
-            # Update sender's balance and add to sent tips
-            transaction.update(sender_ref, {
-                'balance': firestore.Increment(-amount),
-                'tips_sent': firestore.ArrayUnion([tip_data])
-            })
-
-            # Update recipient's received tips
-            recipient_ref = db.collection('humanUsers').document(recipient_doc.id)
-            transaction.update(recipient_ref, {
-                'balance': firestore.Increment(amount),
-                'tips_received': firestore.ArrayUnion([tip_data])
-            })
-
-            # Commit transaction
-            transaction.commit()
-
-            return jsonify({
-                "message": "Tip sent successfully",
-                "new_balance": current_balance - amount,
-                "tip_id": tip_id
-            }), 200
+            @firestore.transactional
+            def apply(transaction):
+                sender = sender_ref.get(transaction=transaction)
+                recipient_ref = db.collection('humanUsers').document(recipient_doc.id)
+                recipient = recipient_ref.get(transaction=transaction)
+                if not sender.exists:
+                    return jsonify({"error": "Sender not found"}), 404
+                if not recipient.exists:
+                    return jsonify({"error": "Recipient not found"}), 404
+                balance = sender.to_dict().get('balance', 200)
+                if balance < amount:
+                    return jsonify({"error": "Insufficient balance"}), 400
+                if sender_ref.path == recipient_ref.path:
+                    transaction.update(sender_ref, {
+                        'tips_sent': firestore.ArrayUnion([tip_data]),
+                        'tips_received': firestore.ArrayUnion([tip_data])
+                    })
+                    new_balance = balance
+                else:
+                    new_balance = balance - amount
+                    transaction.update(sender_ref, {
+                        'balance': new_balance,
+                        'tips_sent': firestore.ArrayUnion([tip_data])
+                    })
+                    transaction.update(recipient_ref, {
+                        'balance': recipient.to_dict().get('balance', 0) + amount,
+                        'tips_received': firestore.ArrayUnion([tip_data])
+                    })
+                return jsonify({"message": "Tip sent successfully",
+                                "new_balance": new_balance, "tip_id": tip_id}), 200
+            return apply(db.transaction(max_attempts=10))
 
         except Exception as e:
             logger.error(f"Error sending tip: {e}")

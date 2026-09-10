@@ -31,13 +31,13 @@ Both `INZONE_OFFER_CHECKOUT_ENABLED=1` and
 404. Leave both unset in production. Catalog authoring keeps its separate flag.
 
 **The second flag is a rollout attestation, not a concurrency mechanism.**
-The existing `_build_coin_response` performs nontransactional balance and summary
-updates. Another legacy purchase/wallet writer can overwrite a concurrently
-committed new checkout. The emulator tests prove atomicity among these new
-transactions, not coexistence with arbitrary legacy writers. Before activation,
-review and serialize/transactionalize all writers to the shared balance/summary
-or establish verified isolation. Do not enable by merely setting the flag.
-Existing legacy routes are deliberately not changed by this PR.
+The in-repository wallet writers now use transactions or atomic credit increments;
+see [Shared wallet transactions](SHARED_WALLET_TRANSACTIONS.md) for coverage and
+compatibility changes. Mixed legacy/new emulator tests cover competing debits,
+credits and accounting. This is source-level evidence, not proof that every live
+writer has been upgraded. Before activation, deploy the cooperating writers
+(including the separate agent service), inventory external/client writers and
+verify their isolation. Do not enable by merely setting the flag.
 
 Also verify deployed Firestore rules deny client writes to `game_offer_catalogs`,
 `game_offer_requests`, `game_product_inventory`, `game_checkout_limits` and the
@@ -109,7 +109,6 @@ real emulator transactions, not an in-memory transaction imitation.
 ## Review and subsequent work
 
 Review this PR against `game-analytics`; do not retarget to `main`. Keep activation
-off. Next backend prerequisite: make the existing shared-wallet writers cooperate
-without changing their public API, with mixed legacy/new concurrency tests.
-Then connect the trusted web checkout confirmation and packaged SDK call to these
+off. The shared-wallet implementation and mixed tests are documented separately.
+Next connect the trusted web checkout confirmation and packaged SDK call to these
 endpoints, verify rules/identity integration, and validate a test deployment.

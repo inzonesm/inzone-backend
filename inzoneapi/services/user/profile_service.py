@@ -177,7 +177,9 @@ class ProfileService:
                 "is_influencer": db.collection('influencers').document(uid).get().exists if uid else False
             }
 
-            doc_ref = db.collection('humanUsers').document(data.get("UID")).set(user_data)
+            from services.monetization.balance_updates import create_wallet_profile
+            if not create_wallet_profile(db, data.get("UID"), user_data):
+                return jsonify({"success": False, "error": "User already exists", "code": "USER_ALREADY_EXISTS"}), 409
             
             # Update Gorse with new user
             try:

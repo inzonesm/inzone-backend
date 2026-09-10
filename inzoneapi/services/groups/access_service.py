@@ -46,68 +46,74 @@ class GroupAccessService:
             if not all([user_id, group_id]):
                 return jsonify({'error': 'Missing required fields'}), 400
 
-            group_ref = db.collection('groups').document(group_id)
-            group_doc = group_ref.get()
+            @firestore.transactional
+            def apply(transaction):
+                group_ref = db.collection('groups').document(group_id)
+                group_doc = group_ref.get(transaction=transaction)
 
-            if not group_doc.exists:
-                return jsonify({'error': 'Group not found'}), 404
+                if not group_doc.exists:
+                    return jsonify({'error': 'Group not found'}), 404
 
-            group = group_doc.to_dict()
+                group = group_doc.to_dict()
 
-            user_ref = db.collection('humanUsers').document(user_id)
-            user_doc = user_ref.get()
+                user_ref = db.collection('humanUsers').document(user_id)
+                user_doc = user_ref.get(transaction=transaction)
 
-            if not user_doc.exists:
-                return jsonify({'error': 'User not found'}), 404
+                if not user_doc.exists:
+                    return jsonify({'error': 'User not found'}), 404
 
-            user_data = user_doc.to_dict()
+                user_data = user_doc.to_dict()
 
-            # Determine pricing and duration based on the tier
-            if tier == 'free':
-                price = 0
-                duration = group.get('free_duration')  # Could be None for indefinite
-            elif tier == 'pass':
-                price = group.get('pass_price', 0)
-                duration = group.get('pass_duration', 1)  # Default to 1 day
-            elif tier == 'vip':
-                price = group.get('vip_price', 0)
-                duration = group.get('vip_duration', 30)  # Default to 30 days
-            else:
-                return jsonify({'error': 'Invalid tier specified'}), 400
+                # Determine pricing and duration based on the tier
+                if tier == 'free':
+                    price = 0
+                    duration = group.get('free_duration')  # Could be None for indefinite
+                elif tier == 'pass':
+                    price = group.get('pass_price', 0)
+                    duration = group.get('pass_duration', 1)  # Default to 1 day
+                elif tier == 'vip':
+                    price = group.get('vip_price', 0)
+                    duration = group.get('vip_duration', 30)  # Default to 30 days
+                else:
+                    return jsonify({'error': 'Invalid tier specified'}), 400
 
-            # Check if user has sufficient funds
-            if price > 0 and user_data.get('balance', 200) < price:
-                return jsonify({'error': 'Insufficient funds'}), 400
+                if type(price) is not int or price < 0:
+                    return jsonify({'error': 'Invalid price'}), 400
 
-            # Deduct funds if necessary
-            if price > 0:
-                user_ref.update({'balance': firestore.Increment(-price)})
+                # Check if user has sufficient funds
+                if price > 0 and user_data.get('balance', 200) < price:
+                    return jsonify({'error': 'Insufficient funds'}), 400
 
-            # Add the group to the user's groups array
-            user_ref.update({'groups': firestore.ArrayUnion([group_id])})
+                # Deduct funds if necessary
+                if price > 0:
+                    transaction.update(user_ref, {'balance': user_data.get('balance', 200) - price})
 
-            # Calculate the subscription end time if a duration is provided
-            if duration:
-                subscription_end = datetime.utcnow() + timedelta(days=duration)
-                subscription_end_iso = subscription_end.isoformat()
-            else:
-                subscription_end_iso = None
+                # Add the group to the user's groups array
+                transaction.update(user_ref, {'groups': firestore.ArrayUnion([group_id])})
 
-            membership_data = {
-                'group_id': group_id,
-                'tier': tier,
-                'subscription_end': subscription_end_iso,
-                'joined_at': datetime.utcnow().isoformat()
-            }
+                # Calculate the subscription end time if a duration is provided
+                if duration:
+                    subscription_end = datetime.utcnow() + timedelta(days=duration)
+                    subscription_end_iso = subscription_end.isoformat()
+                else:
+                    subscription_end_iso = None
 
-            # Save the group subscription in a subcollection under humanUsers
-            db.collection('humanUsers').document(user_id).collection('groups').document(group_id).set(membership_data)
+                membership_data = {
+                    'group_id': group_id,
+                    'tier': tier,
+                    'subscription_end': subscription_end_iso,
+                    'joined_at': datetime.utcnow().isoformat()
+                }
 
-            return jsonify({
-                'message': 'Group joined successfully',
-                'tier': tier,
-                'subscription_end': subscription_end_iso
-            }), 200
+                # Save the group subscription in a subcollection under humanUsers
+                transaction.set(user_ref.collection('groups').document(group_id), membership_data)
+
+                return jsonify({
+                    'message': 'Group joined successfully',
+                    'tier': tier,
+                    'subscription_end': subscription_end_iso
+                }), 200
+            return apply(db.transaction(max_attempts=10))
 
         except Exception as ex:
             logger.error("Error joining group: %s", ex)

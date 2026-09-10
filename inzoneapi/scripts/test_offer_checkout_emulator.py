@@ -9,7 +9,7 @@ import time
 
 
 def main():
-    if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
+    if len(sys.argv) not in (2, 3) or not Path(sys.argv[1]).is_file():
         raise SystemExit('Supply a locally installed Firestore emulator JAR path')
     root = Path(__file__).resolve().parents[2]
     with socket.socket() as sock:
@@ -36,7 +36,7 @@ def main():
                        PYTHONPATH=str(root / 'inzoneapi'), no_grpc_proxy='127.0.0.1,localhost',
                        NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
             return subprocess.run([sys.executable, '-m', 'unittest', 'discover',
-                                   '-s', 'inzoneapi/tests', '-p', 'test_offer_checkout.py', '-v'],
+                                   '-s', 'inzoneapi/tests', '-p', sys.argv[2] if len(sys.argv) == 3 else 'test_offer_checkout.py', '-v'],
                                   cwd=root, env=env, timeout=180).returncode
         finally:
             if emulator.poll() is None:

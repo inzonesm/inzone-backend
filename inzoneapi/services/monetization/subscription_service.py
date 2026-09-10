@@ -314,32 +314,10 @@ class SubscriptionService:
 
                     # If the renewal date has passed, add the monthly reward
                     if datetime.now() >= next_renewal:
-                        # Get current balance
-                        current_balance = user_data.get('balance', 200)
+                        from services.monetization.balance_updates import credit_subscription_reward
+                        if credit_subscription_reward(db, user_id, next_renewal_date, datetime.now()):
+                            processed_count += 1
 
-                        # Add 2500 InCash
-                        new_balance = current_balance + 2500
-
-                        # Update next renewal date (30 days from now)
-                        new_next_renewal = (datetime.now() + timedelta(days=30)).isoformat()
-
-                        # Record subscription reward
-                        reward_history = user_data.get('subscriptionRewards', [])
-                        reward_history.append({
-                            'amount': 2500,
-                            'date': datetime.now().isoformat(),
-                            'type': 'monthly_subscription'
-                        })
-
-                        # Update user document
-                        user_ref = db.collection('humanUsers').document(user_id)
-                        user_ref.update({
-                            'balance': new_balance,
-                            'subscriptionRewards': reward_history,
-                            'subscription.nextRenewalDate': new_next_renewal
-                        })
-
-                        processed_count += 1
 
             return jsonify({
                 'success': True,

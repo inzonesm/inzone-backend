@@ -180,7 +180,7 @@ def chat_popular():
                 if user_snapshot.exists:
                     user_data = user_snapshot.to_dict()
                     current_balance = user_data.get("balance", 0)
-                    user_ref.update({"balance": current_balance + incash})
+                    user_ref.update({"balance": firestore.Increment(incash)})
                     logger.info(f"Added {incash} to balance of user {CREATOR_ID} for {number_of_chats} messages (capped at {capped_count})")
 
             # reset 
