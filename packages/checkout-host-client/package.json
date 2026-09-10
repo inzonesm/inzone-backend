@@ -1,0 +1,10 @@
+{
+  "name": "@inzone/checkout-host-client",
+  "version": "0.1.0-preview.1",
+  "private": true,
+  "type": "module",
+  "exports": {".": {"types": "./index.d.ts", "import": "./index.js"}},
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "scripts": {"test": "node --test client.test.mjs"},
+  "engines": {"node": ">=18"}
+}
