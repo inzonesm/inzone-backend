@@ -201,5 +201,15 @@ logger.info("Initializing digest timers...")
 digest_timer_manager.initialize_timers()
 logger.info("Digest timer initialization complete")
 
+# Opt-in draft monetization catalog; existing SDK routes are unchanged.
+from routes.api.game_offers import create_game_offers_blueprint
+from firebase_admin import auth as _offer_auth
+from dependencies import db as _offer_db
+import os as _offer_os
+app.register_blueprint(create_game_offers_blueprint(
+    _offer_db, lambda token: _offer_auth.verify_id_token(token, check_revoked=True),
+    lambda: _offer_os.environ.get("INZONE_OFFER_CATALOG_ENABLED") == "1",
+))
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=8080)
